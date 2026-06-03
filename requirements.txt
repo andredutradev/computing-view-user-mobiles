@@ -1,0 +1,16 @@
+# ---------------------------------------------------------------------------
+# Dependências do projeto de detecção de uso de celular
+# Python 3.10+
+# ---------------------------------------------------------------------------
+
+# Visão computacional e I/O de vídeo
+opencv-python>=4.8.0
+
+# Detecção de objetos (YOLOv8 / YOLOv11 pré-treinados no dataset COCO)
+ultralytics>=8.2.0
+
+# Operações vetoriais / matemáticas
+numpy>=1.24.0
+
+# Testes
+pytest>=7.4.0

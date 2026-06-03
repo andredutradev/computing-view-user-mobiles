@@ -1,0 +1,17 @@
+# Modo DEMO — recomendado para testar agora
+# (abre uma janela com cena sintética, sem precisar de câmera nem baixar pesos)
+python3 -m src.main --demo
+
+# Webcam em tempo real (modo padrão — baixa yolov8n.pt na 1ª vez)
+python3 -m src.main
+
+# A partir de um arquivo de vídeo
+python3 -m src.main --source file --video data/sample_video.mp4
+
+Rodar os testes (mockam YOLO/câmera, não baixam nada):
+python3 -m pytest -v
+
+Box verde = pessoa usando celular; laranja = pessoa sem celular.
+Sem abrir janela (validação/CI): python3 -m src.main --demo --no-display --max-frames 160
+Gravar saída anotada: adicione --save data/demo_output.mp4
+Ajustes: --model yolov8s.pt, --conf 0.5
