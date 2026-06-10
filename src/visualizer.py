@@ -27,14 +27,23 @@ from src.detector import (
     Detection,
     PersonDetection,
 )
+from src.text_render import TextItem, default_renderer
 
 
 class Visualizer:
-    """Desenha bounding boxes e rótulos legíveis sobre os frames."""
+    """Desenha bounding boxes e rótulos legíveis sobre os frames.
+
+    Formas (caixas, esqueleto, alvo) são desenhadas com OpenCV; **todo texto**
+    passa pelo ``TextRenderer`` (Pillow/TrueType) para que os acentos do
+    português apareçam corretamente. Os rótulos são acumulados durante o
+    ``draw`` e renderizados numa ÚNICA passada ao final (1 conversão BGR↔RGB).
+    """
 
     def __init__(self, config: Config | None = None) -> None:
         self.config = config or settings
-        self._font = cv2.FONT_HERSHEY_SIMPLEX
+        self._text = default_renderer
+        # Tamanho do texto em pixels, derivado do font_scale herdado da config.
+        self._font_px = max(12, int(round(self.config.font_scale * 30)))
 
     # -- API pública --------------------------------------------------------
     def draw(
@@ -42,14 +51,20 @@ class Visualizer:
         frame: np.ndarray,
         people: list[PersonDetection],
         phones: list[Detection] | None = None,
+        identities: dict[int, str] | None = None,
     ) -> np.ndarray:
         """Anota o frame com as pessoas (e opcionalmente os celulares).
 
         Trabalha sobre uma cópia para não mutar o frame original — útil se
         o chamador quiser preservar o frame cru (ex.: gravar em disco).
+
+        ``identities`` (opcional): mapa ``track_id -> nome do aluno`` vindo do
+        sistema de presença; quando presente, o rótulo da pessoa mostra o nome.
         """
         annotated = frame.copy()
         cfg = self.config
+        # Acumula os rótulos para uma única passada de texto (Pillow) ao final.
+        labels: list[TextItem] = []
 
         # Celulares primeiro, para que as caixas de pessoa fiquem por cima.
         for phone in phones or []:
@@ -59,14 +74,19 @@ class Visualizer:
                 color=cfg.color_phone,
                 label=f"{cfg.class_names.get(phone.class_id, 'Celular')} "
                 f"{phone.confidence:.2f}",
+                labels=labels,
             )
 
         for person in people:
             using = person.using_phone
             color = cfg.color_using_phone if using else cfg.color_idle
-            status = "Usando Celular" if using else "Pessoa"
-            label = f"{status} {person.confidence:.2f}"
-            self._draw_box(annotated, person.box, color=color, label=label)
+            self._draw_box(
+                annotated,
+                person.box,
+                color=color,
+                label=self._person_label(person, using, identities),
+                labels=labels,
+            )
             # Esqueleto: braços (ombro→cotovelo→pulso) e mãos (pulsos). Ajuda
             # a enxergar POR QUE a pessoa foi (ou não) marcada como usando.
             self._draw_skeleton(annotated, person)
@@ -75,8 +95,33 @@ class Visualizer:
             if using:
                 self._draw_target(annotated, person.box)
 
-        self._draw_hud(annotated, people)
+        self._draw_hud(annotated, people, labels, identities)
+        # Passada única de texto Unicode (acentos corretos).
+        self._text.render(annotated, labels)
         return annotated
+
+    def _person_label(
+        self,
+        person: PersonDetection,
+        using: bool,
+        identities: dict[int, str] | None,
+    ) -> str:
+        """Monta o rótulo da pessoa: [ID] [nome do aluno] status confiança."""
+        if using:
+            # Distingue uso confirmado por postura (sem caixa de celular vista).
+            status = "Usando Celular (postura)" if person.by_posture else "Usando Celular"
+        else:
+            status = "Pessoa"
+        parts: list[str] = []
+        tid = person.track_id
+        if tid is not None:
+            parts.append(f"#{tid}")
+        # Nome do aluno (presença), quando identificado.
+        if identities is not None and tid is not None and tid in identities:
+            parts.append(identities[tid])
+        parts.append(status)
+        parts.append(f"{person.confidence:.2f}")
+        return " ".join(parts)
 
     # -- helpers internos ---------------------------------------------------
     def _draw_box(
@@ -85,30 +130,28 @@ class Visualizer:
         box: tuple[float, float, float, float],
         color: tuple[int, int, int],
         label: str,
+        labels: list[TextItem],
     ) -> None:
-        """Desenha um retângulo + rótulo com fundo preenchido."""
+        """Desenha o retângulo (cv2) e ENFILEIRA o rótulo (texto Unicode).
+
+        O texto não é desenhado aqui — vai para ``labels`` e é renderizado
+        em lote no fim de ``draw`` (acentos corretos via Pillow).
+        """
         cfg = self.config
         x1, y1, x2, y2 = (int(round(v)) for v in box)
 
         cv2.rectangle(img, (x1, y1), (x2, y2), color, cfg.box_thickness)
 
-        # Caixa de fundo do texto para legibilidade sobre qualquer cena.
-        (tw, th), baseline = cv2.getTextSize(
-            label, self._font, cfg.font_scale, 1
-        )
-        top = max(0, y1 - th - baseline - 4)
-        cv2.rectangle(
-            img, (x1, top), (x1 + tw + 4, y1), color, thickness=cv2.FILLED
-        )
-        cv2.putText(
-            img,
-            label,
-            (x1 + 2, y1 - baseline - 2),
-            self._font,
-            cfg.font_scale,
-            cfg.color_text,
-            1,
-            cv2.LINE_AA,
+        # Rótulo logo acima da caixa, com fundo na cor da caixa (legibilidade).
+        top = max(0, y1 - self._font_px - 6)
+        labels.append(
+            TextItem(
+                text=label,
+                org=(x1 + 3, top),
+                font_px=self._font_px,
+                color=cfg.color_text,
+                bg=color,
+            )
         )
 
     def _draw_skeleton(self, img: np.ndarray, person: PersonDetection) -> None:
@@ -182,24 +225,31 @@ class Visualizer:
         cv2.line(img, (ccx, ccy + gap), (ccx, ccy + arm), color, 1, cv2.LINE_AA)
         cv2.circle(img, (ccx, ccy), 2, color, -1, cv2.LINE_AA)
 
-    def _draw_hud(self, img: np.ndarray, people: list[PersonDetection]) -> None:
-        """Desenha um resumo (HUD) no topo do frame."""
-        cfg = self.config
+    def _draw_hud(
+        self,
+        img: np.ndarray,
+        people: list[PersonDetection],
+        labels: list[TextItem],
+        identities: dict[int, str] | None = None,
+    ) -> None:
+        """Enfileira o resumo (HUD) no topo do frame (texto Unicode)."""
         total = len(people)
         using = sum(1 for p in people if p.using_phone)
-        text = f"Pessoas: {total} | Usando celular: {using}"
+        text = f"Pessoas: {total}  |  Usando celular: {using}"
+        if identities is not None:
+            identified = sum(
+                1
+                for p in people
+                if p.track_id is not None and p.track_id in identities
+            )
+            text += f"  |  Identificados: {identified}"
 
-        (tw, th), baseline = cv2.getTextSize(
-            text, self._font, cfg.font_scale, 1
-        )
-        cv2.rectangle(img, (0, 0), (tw + 10, th + baseline + 8), (0, 0, 0), cv2.FILLED)
-        cv2.putText(
-            img,
-            text,
-            (5, th + 4),
-            self._font,
-            cfg.font_scale,
-            cfg.color_text,
-            1,
-            cv2.LINE_AA,
+        labels.append(
+            TextItem(
+                text=text,
+                org=(6, 4),
+                font_px=self._font_px,
+                color=self.config.color_text,
+                bg=(0, 0, 0),
+            )
         )

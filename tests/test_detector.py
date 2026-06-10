@@ -13,6 +13,9 @@ Os frames são simplesmente arrays numpy (como os que o OpenCV produz).
 
 from __future__ import annotations
 
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -32,6 +35,7 @@ from src.detector import (
     iou,
     person_scale,
     point_box_distance,
+    resolve_device,
     wrist_phone_proximity,
 )
 
@@ -323,3 +327,85 @@ def test_custom_config_thresholds_block_far_wrist(frame):
     )
     people = detector.process_frame(frame)
     assert people[0].using_phone is False
+
+
+# ---------------------------------------------------------------------------
+# Testes de seleção de dispositivo (adaptativa)
+# ---------------------------------------------------------------------------
+def _fake_torch(cuda: bool, mps: bool) -> types.ModuleType:
+    """Monta um módulo torch fake com disponibilidade controlada de cuda/mps."""
+    fake = types.ModuleType("torch")
+    fake.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+    fake.backends = types.SimpleNamespace(
+        mps=types.SimpleNamespace(is_available=lambda: mps)
+    )
+    return fake
+
+
+def test_resolve_device_explicit_passthrough():
+    assert resolve_device("cpu") == "cpu"
+    assert resolve_device("cuda") == "cuda"
+    assert resolve_device("mps") == "mps"
+    assert resolve_device("0") == "0"
+
+
+def test_resolve_device_auto_prefers_cuda(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda=True, mps=True))
+    assert resolve_device("auto") == "cuda"
+
+
+def test_resolve_device_auto_falls_back_to_mps(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda=False, mps=True))
+    assert resolve_device("auto") == "mps"
+
+
+def test_resolve_device_auto_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda=False, mps=False))
+    assert resolve_device("auto") == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Testes de rastreamento (track_id)
+# ---------------------------------------------------------------------------
+class _FakeBoxesTracked(_FakeBoxes):
+    """Como _FakeBoxes, mas também expõe ``id`` (track IDs), como em track()."""
+
+    def __init__(self, xyxy, cls, conf, ids):
+        super().__init__(xyxy, cls, conf)
+        self.id = np.asarray(ids, dtype=np.float32)
+
+
+class _FakeYOLOTrack:
+    """Modelo fake com .track() (em vez de .predict()), devolvendo IDs."""
+
+    def __init__(self, boxes, keypoints=None):
+        self._boxes = boxes
+        self._keypoints = keypoints
+        self.track_calls = 0
+
+    def track(self, frame, **kwargs):
+        self.track_calls += 1
+        return [_FakeResult(self._boxes, self._keypoints)]
+
+
+def test_detect_people_tracked_reads_track_id(frame):
+    boxes = _FakeBoxesTracked(
+        xyxy=[[100, 50, 200, 400]], cls=[0], conf=[0.9], ids=[7]
+    )
+    kp = _person_kp((165, 175))[None, :, :]
+    pose = _FakeYOLOTrack(boxes, _FakeKeypoints(kp))
+    detector = Detector(pose_model=pose)
+    people = detector.detect_people_tracked(frame)
+    assert len(people) == 1
+    assert people[0].track_id == 7
+    assert pose.track_calls == 1
+
+
+def test_detect_people_without_id_has_none_track(frame):
+    """Caminho predict puro (sem .id) -> track_id None, sem quebrar."""
+    boxes = _FakeBoxes(xyxy=[[100, 50, 200, 400]], cls=[0], conf=[0.9])
+    kp = _person_kp((165, 175))[None, :, :]
+    pose = _FakeYOLO(boxes, _FakeKeypoints(kp))
+    detector = Detector(pose_model=pose)
+    people = detector.detect_people(frame)
+    assert people[0].track_id is None

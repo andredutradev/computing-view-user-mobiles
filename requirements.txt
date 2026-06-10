@@ -1,16 +1,42 @@
 # ---------------------------------------------------------------------------
 # Dependências do projeto de detecção de uso de celular
-# Python 3.10+
+# Python 3.9+ (o código usa `from __future__ import annotations`)
 # ---------------------------------------------------------------------------
 
 # Visão computacional e I/O de vídeo
 opencv-python>=4.8.0
 
+# Renderização de texto com acentuação (UTF-8) sobre os frames do OpenCV —
+# o cv2.putText (fontes Hershey) não desenha acentos. Usada pelo text_render.
+Pillow>=9.5.0
+
 # Detecção de objetos (YOLOv8 / YOLOv11 pré-treinados no dataset COCO)
 ultralytics>=8.2.0
 
+# Rastreamento entre frames (ByteTrack/BoT-SORT do ultralytics usam o LAP
+# para a atribuição linear). Sem isso, o ultralytics tenta auto-instalar em
+# tempo de execução.
+lap>=0.5.12
+
 # Operações vetoriais / matemáticas
 numpy>=1.24.0
+
+# ---------------------------------------------------------------------------
+# Sistema de presença em sala (opcional — só necessário com --attendance/--ui)
+# ---------------------------------------------------------------------------
+# Reconhecimento facial dos alunos a partir de foto de referência.
+insightface>=0.7.3
+# Runtime do InsightFace. Para GPU NVIDIA, troque por onnxruntime-gpu
+# (NUNCA instale os dois ao mesmo tempo).
+onnxruntime>=1.16
+# Geração dos relatórios em PDF (pure-Python, leve).
+fpdf2>=2.7
+
+# Painel de controle desktop (interface principal: matrícula por captura,
+# monitoramento e relatórios). Acentos nativos + vídeo embutido. Em Python 3.9
+# use a linha 6.7.x (PySide6 6.8+ exige Python 3.10+).
+PySide6>=6.5,<6.8 ; python_version < "3.10"
+PySide6>=6.5 ; python_version >= "3.10"
 
 # Testes
 pytest>=7.4.0

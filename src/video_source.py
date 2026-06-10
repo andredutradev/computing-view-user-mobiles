@@ -67,6 +67,16 @@ class VideoSource(abc.ABC):
                 break
             yield frame
 
+    @property
+    def fps(self) -> float:
+        """FPS nominal da fonte (usado para mapear frames -> segundos).
+
+        A base devolve o FPS configurado (``output_fps``); fontes que conhecem
+        seu FPS real (arquivo) sobrescrevem. Webcam usa o nominal, pois o FPS
+        efetivo varia com o hardware.
+        """
+        return float(settings.output_fps)
+
     def release(self) -> None:
         """Libera o recurso de captura (idempotente)."""
         if self._capture is not None:
@@ -110,6 +120,16 @@ class FileSource(VideoSource):
                 f"Arquivo de vídeo não encontrado: {self.path}"
             )
         return cv2.VideoCapture(str(self.path))
+
+    @property
+    def fps(self) -> float:
+        """Lê o FPS real do arquivo (cai para o nominal se indisponível)."""
+        cap = cv2.VideoCapture(str(self.path))
+        try:
+            value = cap.get(cv2.CAP_PROP_FPS)
+        finally:
+            cap.release()
+        return float(value) if value and value > 0 else float(settings.output_fps)
 
     def __repr__(self) -> str:
         return f"FileSource(path={self.path!s})"

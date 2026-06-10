@@ -69,18 +69,28 @@ from src.config import Config, settings
 # Só nos interessam os do tronco superior — ombro→cotovelo→PULSO — que formam
 # os braços e localizam as mãos.
 # ---------------------------------------------------------------------------
+KP_NOSE = 0
+KP_L_EYE = 1
+KP_R_EYE = 2
 KP_L_SHOULDER = 5
 KP_R_SHOULDER = 6
 KP_L_ELBOW = 7
 KP_R_ELBOW = 8
 KP_L_WRIST = 9
 KP_R_WRIST = 10
+KP_L_HIP = 11
+KP_R_HIP = 12
 # Segmentos (ombro→cotovelo→pulso) de cada lado, para desenhar os braços.
 ARM_SEGMENTS = (
     (KP_L_SHOULDER, KP_L_ELBOW),
     (KP_L_ELBOW, KP_L_WRIST),
     (KP_R_SHOULDER, KP_R_ELBOW),
     (KP_R_ELBOW, KP_R_WRIST),
+)
+# Pares (ombro, cotovelo, pulso) de cada braço, para a análise de postura.
+ARM_CHAINS = (
+    (KP_L_SHOULDER, KP_L_ELBOW, KP_L_WRIST),
+    (KP_R_SHOULDER, KP_R_ELBOW, KP_R_WRIST),
 )
 
 
@@ -120,6 +130,17 @@ class PersonDetection(Detection):
     # Pulso (x, y) que foi associado ao celular — usado pelo Visualizer para
     # destacar a mão que está segurando o aparelho. None se não há.
     holding_wrist: tuple[float, float] | None = field(default=None)
+    # ID estável de rastreamento (ByteTrack/BoT-SORT) que persiste entre frames.
+    # None quando o tracking está desligado, ainda não "esquentou" (cold-start)
+    # ou o modelo não fornece IDs (ex.: predict puro / mocks de teste).
+    track_id: int | None = field(default=None)
+    # Score [0..1] de POSTURA de uso de celular (mão erguida + cotovelo
+    # flexionado + cabeça baixa), calculado a partir da pose. Independe de o
+    # YOLO ter visto o aparelho — generaliza a detecção. 0.0 sem pose.
+    posture_score: float = 0.0
+    # True quando o "usando celular" foi decidido SOMENTE pela postura (sem uma
+    # caixa de celular associada) — útil para o Visualizer/relatório distinguir.
+    by_posture: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +264,7 @@ def wrist_phone_proximity(
     phone_box: tuple[float, float, float, float],
     person_box: tuple[float, float, float, float],
     cfg: Config,
+    radius_scale: float = 1.0,
 ) -> tuple[bool, tuple[float, float] | None, float]:
     """Decide se algum PULSO da pessoa está perto o bastante do celular.
 
@@ -260,7 +282,11 @@ def wrist_phone_proximity(
     if keypoints is None:
         return (False, None, float("inf"))
 
-    radius = cfg.hand_radius_factor * person_scale(keypoints, person_box, cfg)
+    radius = (
+        cfg.hand_radius_factor
+        * person_scale(keypoints, person_box, cfg)
+        * max(1.0, radius_scale)
+    )
     best_wrist: tuple[float, float] | None = None
     best_dist = float("inf")
     for idx in (KP_L_WRIST, KP_R_WRIST):
@@ -273,6 +299,143 @@ def wrist_phone_proximity(
             best_wrist = (float(wx), float(wy))
 
     return (best_wrist is not None, best_wrist, best_dist)
+
+
+def _kp_ok(kp: np.ndarray | None, idx: int, conf_t: float) -> bool:
+    """True se o keypoint ``idx`` existe e tem confiança >= ``conf_t``."""
+    return kp is not None and idx < len(kp) and float(kp[idx][2]) >= conf_t
+
+
+def _interior_angle(a, b, c) -> float:
+    """Ângulo (graus) no vértice ``b`` do segmento a-b-c. 180° = esticado."""
+    ba = np.array([a[0] - b[0], a[1] - b[1]], dtype=float)
+    bc = np.array([c[0] - b[0], c[1] - b[1]], dtype=float)
+    na, nc = np.linalg.norm(ba), np.linalg.norm(bc)
+    if na < 1e-6 or nc < 1e-6:
+        return 180.0
+    cosang = float(np.clip(np.dot(ba, bc) / (na * nc), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosang)))
+
+
+def phone_use_posture(
+    keypoints: np.ndarray | None,
+    person_box: tuple[float, float, float, float],
+    cfg: Config,
+) -> float:
+    """Score [0..1] de "postura de uso de celular" a partir da pose.
+
+    Combina três pistas robustas e independentes da aparência do aparelho
+    (logo, não dependem das fotos de calibração):
+
+      1. **Mão erguida à frente do tronco** — o pulso está acima da linha do
+         quadril e horizontalmente entre/junto aos ombros (mão trazida ao
+         centro do corpo, como quem segura o telefone), não largada ao lado.
+      2. **Cotovelo flexionado** — o ângulo ombro-cotovelo-pulso é fechado
+         (~< 110°): o antebraço sobe segurando o aparelho.
+      3. **Cabeça inclinada para baixo** — o nariz cai abaixo da linha dos
+         olhos mais do que no estado ereto (olhando para a tela).
+
+    O score é a média ponderada das pistas disponíveis (a (3) só entra se os
+    pontos faciais forem confiáveis). Retorna 0.0 sem pose/ombros confiáveis.
+    """
+    conf_t = cfg.wrist_conf_threshold
+    if not (
+        _kp_ok(keypoints, KP_L_SHOULDER, conf_t)
+        and _kp_ok(keypoints, KP_R_SHOULDER, conf_t)
+    ):
+        return 0.0
+
+    ls = keypoints[KP_L_SHOULDER]
+    rs = keypoints[KP_R_SHOULDER]
+    shoulder_y = (float(ls[1]) + float(rs[1])) / 2.0
+    shoulder_w = max(1.0, float(np.hypot(ls[0] - rs[0], ls[1] - rs[1])))
+    sx_min, sx_max = sorted((float(ls[0]), float(rs[0])))
+
+    # Linha de referência inferior do tronco: quadris se visíveis, senão a base
+    # da caixa (limita a região "acima do quadril").
+    hip_ys = [
+        float(keypoints[i][1])
+        for i in (KP_L_HIP, KP_R_HIP)
+        if _kp_ok(keypoints, i, conf_t)
+    ]
+    hip_y = float(np.mean(hip_ys)) if hip_ys else float(person_box[3])
+    torso_h = max(1.0, hip_y - shoulder_y)
+
+    # -- (1)+(2): melhor braço (mão erguida + cotovelo flexionado) ----------
+    best_arm = 0.0
+    margin = 0.55 * shoulder_w  # tolerância lateral além dos ombros
+    for sh, el, wr in ARM_CHAINS:
+        if not (_kp_ok(keypoints, wr, conf_t) and _kp_ok(keypoints, sh, conf_t)):
+            continue
+        wx, wy = float(keypoints[wr][0]), float(keypoints[wr][1])
+
+        # Altura da mão: 0 na linha do quadril, 1 na linha dos ombros (e além).
+        raised = (hip_y - wy) / torso_h
+        raised_score = float(np.clip(raised / 1.0, 0.0, 1.0))
+
+        # Centralização: mão trazida à frente do corpo (entre os ombros ± margem).
+        centered = 1.0 if (sx_min - margin) <= wx <= (sx_max + margin) else 0.0
+
+        # Cotovelo flexionado (precisa do cotovelo para medir o ângulo).
+        bend_score = 0.0
+        if _kp_ok(keypoints, el, conf_t):
+            ang = _interior_angle(
+                keypoints[sh][:2], keypoints[el][:2], keypoints[wr][:2]
+            )
+            # 160°+ (braço esticado) -> 0 ; 70° ou menos (bem dobrado) -> 1.
+            bend_score = float(np.clip((160.0 - ang) / 90.0, 0.0, 1.0))
+
+        arm = centered * (0.6 * raised_score + 0.4 * bend_score)
+        best_arm = max(best_arm, arm)
+
+    # -- (3): cabeça inclinada para baixo -----------------------------------
+    head_score = None
+    if _kp_ok(keypoints, KP_NOSE, conf_t) and (
+        _kp_ok(keypoints, KP_L_EYE, conf_t) or _kp_ok(keypoints, KP_R_EYE, conf_t)
+    ):
+        eye_ys = [
+            float(keypoints[i][1])
+            for i in (KP_L_EYE, KP_R_EYE)
+            if _kp_ok(keypoints, i, conf_t)
+        ]
+        eye_y = float(np.mean(eye_ys))
+        # Quanto o nariz está abaixo dos olhos, normalizado pela escala da face
+        # (aprox. fração da largura dos ombros). Ereto ~0.05–0.12; olhando para
+        # baixo o nariz desce bem mais. Mapeia 0.12→0 .. 0.32→1.
+        drop = (float(keypoints[KP_NOSE][1]) - eye_y) / shoulder_w
+        head_score = float(np.clip((drop - 0.12) / 0.20, 0.0, 1.0))
+
+    # -- combinação ---------------------------------------------------------
+    if head_score is None:
+        return float(np.clip(best_arm, 0.0, 1.0))
+    # Braço pesa mais (sinal mais discriminante); cabeça reforça.
+    return float(np.clip(0.7 * best_arm + 0.3 * head_score, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Seleção de dispositivo (adaptativa)
+# ---------------------------------------------------------------------------
+def resolve_device(requested: str = "auto") -> str:
+    """Resolve o dispositivo de inferência do torch a usar.
+
+    - Um valor explícito ("cpu", "cuda", "mps", "0", ...) é devolvido como está.
+    - "auto" escolhe o melhor disponível na ordem: CUDA (NVIDIA) -> MPS (Apple
+      Silicon) -> CPU. O import do torch é LOCAL e protegido: em qualquer falha
+      (torch ausente, etc.) caímos para "cpu", nunca quebrando a aplicação.
+    """
+    if requested and requested != "auto":
+        return requested
+    try:  # import local: a geometria/os testes não precisam de torch.
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:  # pragma: no cover - caminho defensivo
+        pass
+    return "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -301,10 +464,16 @@ class Detector:
         self.config = config or settings
         self._model = model
         self._pose_model = pose_model
+        # Dispositivo resolvido em load(). Fica None até lá (testes que injetam
+        # mocks e não chamam load() seguem com device=None, o que os modelos
+        # fake ignoram e o ultralytics real trata como "auto").
+        self._device: str | None = None
 
     # -- ciclo de vida dos modelos -----------------------------------------
     def load(self) -> None:
         """Carrega os pesos YOLO ausentes (detecção e, se ligada, pose)."""
+        # Resolve o dispositivo uma única vez (cuda -> mps -> cpu, ou explícito).
+        self._device = resolve_device(self.config.device)
         if self._model is None:
             # Import local para não exigir ultralytics em quem só usa a
             # geometria (e para não pesar a importação do pacote/testes).
@@ -396,6 +565,10 @@ class Detector:
             if xyxy is None or cls is None or conf is None:
                 continue
 
+            # IDs de rastreamento: presentes só quando veio de model.track(...).
+            # Em predict puro (ou mocks) o atributo não existe / é None -> None.
+            ids = _to_numpy(getattr(boxes, "id", None))
+
             kp_all = _extract_keypoints(getattr(result, "keypoints", None))
 
             for i in range(len(xyxy)):
@@ -407,12 +580,16 @@ class Detector:
                     if kp_all is not None and i < len(kp_all)
                     else None
                 )
+                track_id = (
+                    int(ids[i]) if ids is not None and i < len(ids) else None
+                )
                 people.append(
                     PersonDetection(
                         class_id=cfg.person_class_id,
                         confidence=float(conf[i]),
                         box=(x1, y1, x2, y2),
                         keypoints=kp,
+                        track_id=track_id,
                     )
                 )
         return people
@@ -424,9 +601,11 @@ class Detector:
         cfg = self.config
         results = self.model.predict(
             frame,
-            conf=cfg.confidence_threshold,
+            conf=cfg.phone_confidence_threshold,
             iou=cfg.nms_iou_threshold,
             classes=[cfg.phone_class_id],
+            imgsz=cfg.imgsz,
+            device=self._device,
             verbose=False,
         )
         return [
@@ -444,6 +623,32 @@ class Detector:
             conf=cfg.confidence_threshold,
             iou=cfg.nms_iou_threshold,
             classes=[cfg.person_class_id],
+            imgsz=cfg.imgsz,
+            device=self._device,
+            verbose=False,
+        )
+        return self._parse_pose_results(results, cfg)
+
+    def detect_people_tracked(self, frame: np.ndarray) -> list[PersonDetection]:
+        """Como ``detect_people``, mas com rastreamento entre frames.
+
+        Usa ``pose_model.track(persist=True, tracker=...)`` (ByteTrack/BoT-SORT
+        embutidos no ultralytics) para atribuir um ``track_id`` estável a cada
+        pessoa. O ``persist=True`` mantém o estado do tracker entre chamadas
+        consecutivas — por isso esta instância de Detector deve processar os
+        frames em ordem. No primeiro frame (cold-start) os IDs podem vir nulos.
+        """
+        self._validate_frame(frame)
+        cfg = self.config
+        results = self.pose_model.track(
+            frame,
+            persist=True,
+            tracker=cfg.tracker_config,
+            conf=cfg.confidence_threshold,
+            iou=cfg.nms_iou_threshold,
+            classes=[cfg.person_class_id],
+            imgsz=cfg.imgsz,
+            device=self._device,
             verbose=False,
         )
         return self._parse_pose_results(results, cfg)
@@ -454,26 +659,45 @@ class Detector:
         people: list[PersonDetection],
         phones: list[Detection],
     ) -> list[PersonDetection]:
-        """Decide quais pessoas estão SEGURANDO um celular.
+        """Decide quais pessoas estão SEGURANDO/USANDO um celular.
 
         Para cada celular:
           1. (Sinal primário) Pulso-proximidade: entre as pessoas cujo PULSO
-             cai dentro do raio do celular, vence a de pulso mais próximo.
+             cai dentro do raio do celular, vence a de pulso mais próximo. O
+             raio é AMPLIADO quando a POSTURA da pessoa indica uso (mão erguida
+             + cotovelo dobrado + cabeça baixa), o que recupera celulares
+             escuros/borrados que saem com a caixa ligeiramente fora do raio.
           2. (Fallback) Contenção: se NENHUM pulso confiável está perto, só aí
              usamos a geometria antiga (IoU/contenção sobre a caixa inteira),
              e apenas para pessoas cujos pulsos não são visíveis — assim, ver o
              pulso longe do celular significa "não está segurando" (precisão).
+          3. (Sinal de POSTURA autônomo) Mesmo sem caixa de celular, marca uso
+             quando a postura é fortemente típica (``posture_standalone_threshold``)
+             — generaliza além do que o detector COCO consegue ver.
         """
         cfg = self.config
 
+        # Postura calculada UMA vez por pessoa (independe do celular). Vira
+        # tanto reforço do raio (passo 1) quanto sinal autônomo (passo 3).
+        for person in people:
+            person.posture_score = (
+                phone_use_posture(person.keypoints, person.box, cfg)
+                if cfg.posture_enabled
+                else 0.0
+            )
+
         for phone in phones:
-            # -- Passo 1: pulso-proximidade --------------------------------
+            # -- Passo 1: pulso-proximidade (raio reforçado pela postura) ---
             best_person: PersonDetection | None = None
             best_wrist: tuple[float, float] | None = None
             best_score = float("inf")
             for person in people:
+                # Postura forte amplia o raio de tolerância pulso↔celular.
+                scale = 1.0
+                if person.posture_score >= cfg.posture_assist_threshold:
+                    scale = 1.0 + cfg.posture_radius_bonus * person.posture_score
                 holding, wrist, score = wrist_phone_proximity(
-                    person.keypoints, phone.box, person.box, cfg
+                    person.keypoints, phone.box, person.box, cfg, radius_scale=scale
                 )
                 if holding and score < best_score:
                     best_score = score
@@ -505,12 +729,25 @@ class Detector:
 
             if best_person is not None:
                 best_person.using_phone = True
+                best_person.by_posture = False
                 best_person.holding_wrist = best_wrist
                 # Mantém apenas o celular mais "forte" se já houver um.
                 if best_person.matched_phone is None or (
                     phone.confidence > best_person.matched_phone.confidence
                 ):
                     best_person.matched_phone = phone
+
+        # -- Passo 3: postura autônoma (sem caixa de celular) ---------------
+        # Para quem ainda não foi marcado por um celular detectado, a postura
+        # muito típica de uso já basta. Limiar alto + suavização temporal
+        # contêm falsos positivos.
+        if cfg.posture_enabled:
+            for person in people:
+                if not person.using_phone and (
+                    person.posture_score >= cfg.posture_standalone_threshold
+                ):
+                    person.using_phone = True
+                    person.by_posture = True
 
         return people
 
@@ -525,11 +762,16 @@ class Detector:
         self._validate_frame(frame)
         cfg = self.config
         if not cfg.pose_enabled:
+            # Roda no limiar mais baixo (do celular) para não perder o aparelho
+            # e, depois, exige o limiar maior só para a PESSOA — assim mantemos
+            # recall do celular sem afrouxar a detecção de pessoas.
             results = self.model.predict(
                 frame,
-                conf=cfg.confidence_threshold,
+                conf=cfg.phone_confidence_threshold,
                 iou=cfg.nms_iou_threshold,
                 classes=[cfg.person_class_id, cfg.phone_class_id],
+                imgsz=cfg.imgsz,
+                device=self._device,
                 verbose=False,
             )
             detections = self._parse_results(results, cfg)
@@ -537,6 +779,7 @@ class Detector:
                 PersonDetection(d.class_id, d.confidence, d.box)
                 for d in detections
                 if d.class_id == cfg.person_class_id
+                and d.confidence >= cfg.confidence_threshold
             ]
             phones = [
                 d for d in detections if d.class_id == cfg.phone_class_id
@@ -544,6 +787,18 @@ class Detector:
             return self.associate(people, phones)
 
         people = self.detect_people(frame)
+        phones = self.detect_phones(frame)
+        return self.associate(people, phones)
+
+    def process_frame_tracked(self, frame: np.ndarray) -> list[PersonDetection]:
+        """Igual a ``process_frame`` (caminho com pose), mas com rastreamento.
+
+        Usa ``detect_people_tracked`` para obter pessoas com ``track_id``
+        estável. Requer pose LIGADA — o orquestrador (``main``) só ativa este
+        caminho quando ``pose_enabled`` e ``tracking_enabled`` são verdadeiros.
+        """
+        self._validate_frame(frame)
+        people = self.detect_people_tracked(frame)
         phones = self.detect_phones(frame)
         return self.associate(people, phones)
 

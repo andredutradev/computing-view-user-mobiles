@@ -1,17 +1,98 @@
-# Modo DEMO — recomendado para testar agora
-# (abre uma janela com cena sintética, sem precisar de câmera nem baixar pesos)
-python3 -m src.main --demo
+============================================================
+COMO INICIAR O SISTEMA — Computing View (uso de celular + presença)
+============================================================
 
-# Webcam em tempo real (modo padrão — baixa yolov8n.pt na 1ª vez)
-python3 -m src.main
+Pré-requisitos (uma vez):
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip3 install -r requirements.txt
+  # 1ª execução baixa sozinho os pesos YOLO11: yolo11m.pt (celular) e
+  # yolo11s-pose.pt (braços/mãos). O pacote facial buffalo_l (~300MB) baixa
+  # no 1º uso de --attendance/--ui.
 
-# A partir de um arquivo de vídeo
-python3 -m src.main --source file --video data/sample_video.mp4
 
-Rodar os testes (mockam YOLO/câmera, não baixam nada):
-python3 -m pytest -v
+------------------------------------------------------------
+1) PAINEL COM BOTÕES (recomendado) — interface antes da câmera
+------------------------------------------------------------
+  python3 -m src.main --ui
 
-Box verde = pessoa usando celular; laranja = pessoa sem celular.
-Sem abrir janela (validação/CI): python3 -m src.main --demo --no-display --max-frames 160
-Gravar saída anotada: adicione --save data/demo_output.mp4
-Ajustes: --model yolov8s.pt, --conf 0.5
+  Abre uma janela com botões: MATRICULAR alunos, INICIAR (abre a câmera) e
+  GERAR RELATÓRIO. Atalhos: I=iniciar  R=relatório  M=matricular  Q/ESC=sair.
+  Na janela do vídeo, pressione 'q' para encerrar a sessão.
+
+  >> macOS / JANELA PRETA: o Tk do sistema (8.5) abre a janela preta. O --ui
+     detecta isso e usa AUTOMATICAMENTE um painel equivalente em OpenCV.
+     Para forçar: CVUM_UI_BACKEND=cv (OpenCV) ou =tk (Tkinter).
+
+
+------------------------------------------------------------
+2) NOMEAR CADA PESSOA (matrícula por pasta de fotos)
+------------------------------------------------------------
+  Coloque 1 foto por pessoa em data/students/ — o NOME DO ARQUIVO vira o nome:
+    data/students/ana_silva.jpg          -> "ana_silva"
+    data/students/bruno/frente.jpg       -> "bruno" (subpasta = várias fotos)
+
+  Depois matricule (gera data/students/gallery.npz):
+    python3 -m src.main --enroll data/students
+
+
+------------------------------------------------------------
+3) MONITORAR COM PRESENÇA + TEMPO DE CELULAR POR PESSOA
+------------------------------------------------------------
+  # Webcam ao vivo, com reconhecimento e relatórios ao final
+  python3 -m src.main --attendance
+
+  # A partir de um arquivo de vídeo
+  python3 -m src.main --attendance --source file --video data/sample_video.mp4
+
+  Ao encerrar (tecla 'q'), os relatórios são gravados em
+  data/reports/<fonte>_<timestamp>/:
+    - frequencia.csv/pdf -> por pessoa: presente?, tempo total, TEMPO USANDO
+      O CELULAR (phone_hms) e % no celular (pct_phone). Quem usa o celular sem
+      estar matriculado aparece como "Pessoa #ID".
+    - ocupacao.csv/pdf   -> série temporal + pico/média de ocupação.
+
+
+------------------------------------------------------------
+4) VALIDAR/CALIBRAR A PRECISÃO DO CELULAR (sem abrir a câmera)
+------------------------------------------------------------
+  Ponha fotos de pessoas usando o celular numa pasta e rode:
+    python3 -m src.main --eval-images training_true_examples
+  Mostra, por imagem, se foi reconhecida como "usando celular" + a taxa total.
+  Se alguma sair NAO: baixe CVUM_PHONE_CONF, suba CVUM_IMGSZ ou afrouxe
+  CVUM_HAND_RADIUS / CVUM_WRIST_CONF.
+
+
+------------------------------------------------------------
+OUTROS MODOS
+------------------------------------------------------------
+  # DEMO (cena sintética, sem câmera nem pesos)
+  python3 -m src.main --demo
+
+  # Detecção de celular pura (sem presença), webcam
+  python3 -m src.main
+
+  # Gravar a saída anotada em vídeo
+  python3 -m src.main --save data/saida.mp4
+
+  # Sem janela (validação/CI)
+  python3 -m src.main --demo --no-display --max-frames 160
+
+  # Rodar os testes (mockam YOLO/câmera, não baixam nada)
+  python3 -m pytest -q
+
+
+------------------------------------------------------------
+AJUSTES RÁPIDOS (CLI ou variáveis de ambiente CVUM_*)
+------------------------------------------------------------
+  Box VERDE = usando celular | LARANJA = sem celular | AZUL = o celular.
+
+  Precisão x velocidade:
+    --imgsz 1280                          # mais recall do celular (mais lento)
+    CVUM_PHONE_CONF=0.20                  # limiar SÓ do celular (padrão 0.25)
+    # Máquina fraca / tempo real máximo (volta ao modelo leve):
+    CVUM_MODEL_PATH=yolov8n.pt CVUM_POSE_MODEL=yolov8n-pose.pt CVUM_IMGSZ=640 \
+      python3 -m src.main --attendance
+
+  Regra da mão: CVUM_HAND_RADIUS (raio pulso↔celular), CVUM_WRIST_CONF.
+  Reconhecimento facial: CVUM_FACE_THRESH (similaridade mínima).
