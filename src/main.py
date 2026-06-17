@@ -310,6 +310,8 @@ def _run_enrollment(config: Config, photos_dir: str) -> int:
 
 def _build_attendance_tracker(config: Config, video_source: VideoSource):
     """Monta o AttendanceTracker (galeria + reconhecedor) para a sessão."""
+    from datetime import datetime
+
     from src.attendance.attendance import AttendanceTracker
     from src.attendance.enrollment import Gallery
     from src.attendance.face_recognizer import FaceRecognizer
@@ -328,6 +330,7 @@ def _build_attendance_tracker(config: Config, video_source: VideoSource):
         recognizer=recognizer,
         fps=fps,
         source_label=label,
+        started_at=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
     )
 
 
@@ -417,8 +420,11 @@ def main(argv: list[str] | None = None) -> int:
 
         from src.attendance.reports import generate_reports
 
-        session = attendance_tracker.finalize()
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        now = datetime.now()
+        session = attendance_tracker.finalize(
+            ended_at=now.strftime("%d/%m/%Y %H:%M:%S")
+        )
+        stamp = now.strftime("%Y%m%d_%H%M%S")
         paths = generate_reports(
             session, out_dir=config.reports_dir, stamp=stamp, config=config
         )

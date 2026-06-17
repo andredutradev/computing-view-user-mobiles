@@ -41,7 +41,12 @@ def attendance_rows(session: Session, cfg: Config) -> list:
     rows = []
     for sid, st in sorted(session.students.items()):
         present_s = st.present_seconds
-        present = present_s >= cfg.attendance_min_seconds
+        # Aluno CADASTRADO (id não-anônimo) identificado em qualquer instante do
+        # monitoramento conta como PRESENTE: a identidade facial é sinal forte e
+        # dispensa o limiar de tempo mínimo (que serve só p/ tracks anônimos).
+        is_enrolled = not sid.startswith("anon_")
+        seen = st.first_seen_t is not None
+        present = (is_enrolled and seen) or (present_s >= cfg.attendance_min_seconds)
         pct = (present_s / duration * 100.0) if duration > 0 else 0.0
         phone_s = st.phone_seconds
         # % do tempo de celular sobre a permanência (quanto da presença foi no
@@ -54,6 +59,8 @@ def attendance_rows(session: Session, cfg: Config) -> list:
                 "student_id": sid,
                 "display_name": st.display_name,
                 "present": "sim" if present else "nao",
+                # Ícone para leitura humana (CSV/planilha): check se presente, x se ausente.
+                "presenca": "✓" if present else "x",
                 "total_seconds": round(present_s, 1),
                 "total_hms": hms(present_s),
                 "phone_seconds": round(phone_s, 1),
@@ -76,6 +83,7 @@ def write_attendance_csv(session: Session, path: Path, cfg: Config) -> Path:
     fields = [
         "student_id",
         "display_name",
+        "presenca",
         "present",
         "total_seconds",
         "total_hms",
@@ -144,6 +152,37 @@ def _ln(pdf, h: float, text: str) -> None:
     pdf.cell(0, h, _safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
+def _write_period(pdf, session: Session) -> None:
+    """Escreve início/fim do monitoramento e a duração (HH:MM:SS) no cabeçalho."""
+    if session.started_at:
+        _ln(pdf, 6, f"Início do monitoramento: {session.started_at}")
+    if session.ended_at:
+        _ln(pdf, 6, f"Fim do monitoramento: {session.ended_at}")
+    _ln(pdf, 6, f"Duração: {hms(session.duration_seconds)}")
+
+
+def _draw_presence(pdf, w: float, h: float, present: bool) -> None:
+    """Desenha a célula de presença com ícone vetorial (check verde / x vermelho).
+
+    As fontes core do fpdf2 são latin-1 e não têm o caractere de check (✓), então
+    o ícone é traçado com linhas — sempre renderiza, independente da fonte.
+    """
+    x, y = pdf.get_x(), pdf.get_y()
+    pdf.cell(w, h, "", border=1)  # célula vazia com borda (avança o cursor)
+    cx, cy = x + w / 2, y + h / 2
+    pdf.set_line_width(0.6)
+    if present:
+        pdf.set_draw_color(0, 150, 0)  # check verde
+        pdf.line(cx - 2.2, cy + 0.2, cx - 0.6, cy + 1.8)
+        pdf.line(cx - 0.6, cy + 1.8, cx + 2.4, cy - 1.8)
+    else:
+        pdf.set_draw_color(200, 0, 0)  # x vermelho
+        pdf.line(cx - 1.8, cy - 1.8, cx + 1.8, cy + 1.8)
+        pdf.line(cx - 1.8, cy + 1.8, cx + 1.8, cy - 1.8)
+    pdf.set_draw_color(0, 0, 0)  # restaura padrões
+    pdf.set_line_width(0.2)
+
+
 def write_attendance_pdf(session: Session, path: Path, cfg: Config) -> Path:
     pdf = _new_pdf()
     pdf.add_page()
@@ -151,32 +190,36 @@ def write_attendance_pdf(session: Session, path: Path, cfg: Config) -> Path:
     _ln(pdf, 10, "Relatório de Frequência")
     pdf.set_font("Helvetica", "", 10)
     _ln(pdf, 6, f"Fonte: {session.source_label}")
-    _ln(pdf, 6, f"Duração da sessão: {hms(session.duration_seconds)}")
+    _write_period(pdf, session)
     present_count = sum(
         1 for r in attendance_rows(session, cfg) if r["present"] == "sim"
     )
     _ln(pdf, 6, f"Presentes: {present_count} / {len(session.students)}")
     pdf.ln(2)
 
-    headers = ["Aluno", "Pres.", "Tempo", "Celular", "1o", "Ult.", "%"]
-    widths = [56, 14, 24, 24, 22, 22, 14]
+    headers = [
+        "Nome",
+        "Presença",
+        "Tempo à Vista",
+        "Tempo Celular",
+        "% Cel.",
+        "Entrada",
+        "Saída",
+    ]
+    widths = [46, 20, 27, 27, 16, 22, 22]
     pdf.set_font("Helvetica", "B", 9)
     for h, w in zip(headers, widths):
-        pdf.cell(w, 7, _safe(h), border=1)
+        pdf.cell(w, 7, _safe(h), border=1, align="C")
     pdf.ln()
     pdf.set_font("Helvetica", "", 9)
     for r in attendance_rows(session, cfg):
-        cells = [
-            r["display_name"],
-            r["present"],
-            r["total_hms"],
-            r["phone_hms"],
-            r["first_seen"],
-            r["last_seen"],
-            f"{r['pct_session']}",
-        ]
-        for value, w in zip(cells, widths):
-            pdf.cell(w, 6, _safe(value), border=1)
+        pdf.cell(widths[0], 6, _safe(r["display_name"]), border=1)
+        _draw_presence(pdf, widths[1], 6, r["present"] == "sim")
+        pdf.cell(widths[2], 6, _safe(r["total_hms"]), border=1, align="C")
+        pdf.cell(widths[3], 6, _safe(r["phone_hms"]), border=1, align="C")
+        pdf.cell(widths[4], 6, _safe(f"{r['pct_phone']}%"), border=1, align="C")
+        pdf.cell(widths[5], 6, _safe(r["first_seen"]), border=1, align="C")
+        pdf.cell(widths[6], 6, _safe(r["last_seen"]), border=1, align="C")
         pdf.ln()
     pdf.output(str(path))
     return path
@@ -190,7 +233,7 @@ def write_occupancy_pdf(session: Session, path: Path) -> Path:
     pdf.set_font("Helvetica", "", 10)
     peak_t, peak_n = session.peak_occupancy()
     _ln(pdf, 6, f"Fonte: {session.source_label}")
-    _ln(pdf, 6, f"Duração da sessão: {hms(session.duration_seconds)}")
+    _write_period(pdf, session)
     _ln(pdf, 6, f"Ocupação de pico: {peak_n} (em {hms(peak_t)})")
     _ln(pdf, 6, f"Ocupação média: {session.average_occupancy():.1f}")
     _ln(pdf, 6, f"Amostras de ocupação: {len(session.occupancy)}")

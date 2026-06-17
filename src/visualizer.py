@@ -110,6 +110,9 @@ class Visualizer:
         if using:
             # Distingue uso confirmado por postura (sem caixa de celular vista).
             status = "Usando Celular (postura)" if person.by_posture else "Usando Celular"
+        elif getattr(person, "on_laptop", False):
+            # Mão no teclado: deixa explícito que NÃO é celular (é notebook).
+            status = "Usando Notebook"
         else:
             status = "Pessoa"
         parts: list[str] = []

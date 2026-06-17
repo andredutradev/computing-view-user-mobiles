@@ -28,6 +28,13 @@ from src.attendance.session import OccupancySample, Session
 from src.config import Config, settings
 
 
+def _now_str() -> str:
+    """Data/hora atual formatada (dd/mm/aaaa HH:MM:SS) p/ o relatório."""
+    from datetime import datetime
+
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+
 class MovementState(str, Enum):
     SEATED = "sentado"
     MOVING = "movimentando"
@@ -59,12 +66,19 @@ class AttendanceTracker:
         recognizer=None,
         fps: float = 25.0,
         source_label: str = "webcam",
+        started_at: str = "",
     ) -> None:
         self.config = config or settings
         self.gallery = gallery
         self.recognizer = recognizer
         self.fps = float(fps) if fps and fps > 0 else float(self.config.output_fps)
-        self.session = Session(fps=self.fps, source_label=source_label)
+        # Início real (wall-clock) do monitoramento: usa o que o chamador injetar
+        # ou, na falta, captura agora — assim o relatório sempre registra a data.
+        self.session = Session(
+            fps=self.fps,
+            source_label=source_label,
+            started_at=started_at or _now_str(),
+        )
         self.identity = IdentityCache()
         self._tracks: dict = {}  # dict[int, TrackState]
 
@@ -202,7 +216,12 @@ class AttendanceTracker:
             state.seated_frames = 0
 
     # -- finalização --------------------------------------------------------
-    def finalize(self) -> Session:
-        """Fecha os intervalos abertos e devolve a sessão pronta p/ relatório."""
+    def finalize(self, ended_at: str = "") -> Session:
+        """Fecha os intervalos abertos e devolve a sessão pronta p/ relatório.
+
+        ``ended_at`` (data/hora real do fim, já formatada) é gravado na sessão
+        para constar no relatório; vazio captura o instante atual.
+        """
+        self.session.ended_at = ended_at or _now_str()
         self.session.finalize()
         return self.session

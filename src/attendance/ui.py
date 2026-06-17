@@ -261,6 +261,7 @@ class ControlPanel:
                 recognizer=recognizer,
                 fps=fps,
                 source_label=label,
+                started_at=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             )
             self._attendance = tracker
             app = Application(
@@ -280,7 +281,9 @@ class ControlPanel:
             self._set_status(f"Erro: {exc}")
         finally:
             if self._attendance is not None:
-                self._session = self._attendance.finalize()
+                self._session = self._attendance.finalize(
+                    ended_at=datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                )
             self.root.after(0, self._on_run_done)
 
     def _on_frame(self, annotated, people, frame_index) -> None:

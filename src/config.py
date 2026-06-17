@@ -84,7 +84,7 @@ class Config:
     # e muitas vezes parcialmente oculto na mão, ele costuma sair com confiança
     # mais baixa que a pessoa — por isso um limiar próprio, mais permissivo,
     # melhora bastante o recall sem afrouxar a detecção de pessoas.
-    phone_confidence_threshold: float = _env_float("CVUM_PHONE_CONF", 0.25)
+    phone_confidence_threshold: float = _env_float("CVUM_PHONE_CONF", 0.20)
 
     # IoU usado pelo NMS interno do YOLO (não confundir com o IoU
     # pessoa↔celular calculado na regra de negócio).
@@ -182,12 +182,29 @@ class Config:
     # fraca), CONFIRMAR o uso (melhora o recall em celulares escuros).
     posture_assist_threshold: float = _env_float("CVUM_POSTURE_ASSIST", 0.45)
     # Score [0..1] mínimo para marcar uso APENAS pela postura (sem caixa de
-    # celular). Mais alto, pois é o sinal mais sujeito a falso-positivo; a
-    # suavização temporal/histerese ainda filtra oscilações.
-    posture_standalone_threshold: float = _env_float("CVUM_POSTURE_SOLO", 0.70)
+    # celular). É o sinal que pega o celular ESCONDIDO/irreconhecível na mão; a
+    # supressão por notebook (abaixo) + a suavização temporal contêm o falso-
+    # positivo, então pode ser mais permissivo que o limiar antigo (0.70).
+    posture_standalone_threshold: float = _env_float("CVUM_POSTURE_SOLO", 0.55)
     # Fator de folga adicionado ao raio pulso↔celular quando a postura é forte
     # (a mão na posição típica "puxa" celulares um pouco mais distantes).
     posture_radius_bonus: float = _env_float("CVUM_POSTURE_RADIUS_BONUS", 0.6)
+
+    # ------------------------------------------------------------------
+    # Supressão por NOTEBOOK (contexto de objeto) — evita falso-positivo
+    # ------------------------------------------------------------------
+    # Quem usa notebook tem a MESMA postura do celular (cabeça baixa + mãos à
+    # frente), então a postura sozinha não os separa. O separador robusto é o
+    # contexto: se um PULSO da pessoa está sobre/junto a um NOTEBOOK detectado
+    # (classe COCO 63, que sai com alta confiança), ela está digitando — não
+    # marcamos uso de celular por postura nela. O celular REAL detectado na mão
+    # ainda conta (o usuário de notebook não tem caixa de celular no pulso).
+    laptop_class_id: int = 63
+    laptop_suppression_enabled: bool = _env_bool("CVUM_LAPTOP_SUPPRESS", True)
+    # Confiança mínima para aceitar um notebook como contexto de supressão.
+    laptop_confidence_threshold: float = _env_float("CVUM_LAPTOP_CONF", 0.40)
+    # Raio (× escala da pessoa) para considerar o pulso "sobre" o notebook.
+    laptop_wrist_radius_factor: float = _env_float("CVUM_LAPTOP_RADIUS", 0.5)
 
     # ------------------------------------------------------------------
     # Cores (BGR — padrão do OpenCV) e estilo de desenho

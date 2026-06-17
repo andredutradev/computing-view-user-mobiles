@@ -125,6 +125,11 @@ class Session:
     fps: float
     source_label: str = "webcam"
     started_t: float = 0.0
+    # Data/hora reais (wall-clock) de início e fim do monitoramento, já
+    # formatadas pelo chamador (ex.: "17/06/2026 14:30:00"). Vazio se não
+    # informado — a stdlib de datas é injetada de fora para manter testabilidade.
+    started_at: str = ""
+    ended_at: str = ""
     students: dict = field(default_factory=dict)  # dict[str, StudentSession]
     occupancy: list = field(default_factory=list)  # list[OccupancySample]
     last_t: float = 0.0

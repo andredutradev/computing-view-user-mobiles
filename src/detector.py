@@ -141,6 +141,10 @@ class PersonDetection(Detection):
     # True quando o "usando celular" foi decidido SOMENTE pela postura (sem uma
     # caixa de celular associada) — útil para o Visualizer/relatório distinguir.
     by_posture: bool = False
+    # True quando a pessoa tem um PULSO sobre/junto a um NOTEBOOK detectado
+    # (está digitando). Suprime o sinal de postura para não confundir com
+    # celular. Não impede um celular REAL detectado na mão.
+    on_laptop: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +305,32 @@ def wrist_phone_proximity(
     return (best_wrist is not None, best_wrist, best_dist)
 
 
+def wrist_over_any_box(
+    keypoints: np.ndarray | None,
+    boxes: list[tuple[float, float, float, float]],
+    person_box: tuple[float, float, float, float],
+    cfg: Config,
+    radius_factor: float,
+) -> bool:
+    """True se algum PULSO confiável está sobre/junto a alguma das ``boxes``.
+
+    Usado para detectar "mão no objeto" — em especial mão no NOTEBOOK (teclado),
+    o que indica digitação e não uso de celular. O raio escala com o tamanho da
+    pessoa (``radius_factor`` × largura dos ombros), então vale perto ou longe.
+    """
+    if keypoints is None or not boxes:
+        return False
+    radius = radius_factor * person_scale(keypoints, person_box, cfg)
+    for idx in (KP_L_WRIST, KP_R_WRIST):
+        wx, wy, wconf = keypoints[idx]
+        if wconf < cfg.wrist_conf_threshold:
+            continue
+        for box in boxes:
+            if point_box_distance(float(wx), float(wy), box) <= radius:
+                return True
+    return False
+
+
 def _kp_ok(kp: np.ndarray | None, idx: int, conf_t: float) -> bool:
     """True se o keypoint ``idx`` existe e tem confiança >= ``conf_t``."""
     return kp is not None and idx < len(kp) and float(kp[idx][2]) >= conf_t
@@ -324,19 +354,26 @@ def phone_use_posture(
 ) -> float:
     """Score [0..1] de "postura de uso de celular" a partir da pose.
 
-    Combina três pistas robustas e independentes da aparência do aparelho
-    (logo, não dependem das fotos de calibração):
+    Calibrado sobre vídeo real de sala de aula (pessoa sentada mexendo no
+    celular à frente do corpo, mesmo escondido no colo/abaixo da banca).
+    Combina pistas robustas e independentes da aparência do aparelho — logo
+    pegam o celular mesmo quando o YOLO não o enxerga:
 
-      1. **Mão erguida à frente do tronco** — o pulso está acima da linha do
-         quadril e horizontalmente entre/junto aos ombros (mão trazida ao
-         centro do corpo, como quem segura o telefone), não largada ao lado.
-      2. **Cotovelo flexionado** — o ângulo ombro-cotovelo-pulso é fechado
-         (~< 110°): o antebraço sobe segurando o aparelho.
-      3. **Cabeça inclinada para baixo** — o nariz cai abaixo da linha dos
-         olhos mais do que no estado ereto (olhando para a tela).
+      1. **Mão à frente do tronco e ABAIXO da linha dos ombros** (``best_arm``)
+         — o pulso está horizontalmente entre/junto aos ombros (mão trazida ao
+         centro, segurando o aparelho) e desce abaixo dos ombros: quem mexe no
+         celular sentado mantém as mãos baixas, no colo/à frente — NÃO erguidas
+         na altura da mesa como quem digita num teclado. Exige também o cotovelo
+         flexionado (antebraço dobrado segurando o aparelho).
+      2. **Mãos convergindo** (``conv``) — os dois pulsos próximos um do outro
+         (segurando um único objeto pequeno), ao contrário das mãos afastadas
+         na largura de um teclado.
+      3. **Cabeça inclinada para baixo** (``head``) — o nariz cai abaixo da
+         linha dos olhos (olhando para a tela). Reforço leve.
 
-    O score é a média ponderada das pistas disponíveis (a (3) só entra se os
-    pontos faciais forem confiáveis). Retorna 0.0 sem pose/ombros confiáveis.
+    Retorna 0.0 sem pose/ombros confiáveis. OBS.: a postura de quem usa NOTEBOOK
+    é parecida; a separação fina é feita por contexto (supressão por notebook em
+    ``Detector.associate``), não aqui.
     """
     conf_t = cfg.wrist_conf_threshold
     if not (
@@ -351,32 +388,25 @@ def phone_use_posture(
     shoulder_w = max(1.0, float(np.hypot(ls[0] - rs[0], ls[1] - rs[1])))
     sx_min, sx_max = sorted((float(ls[0]), float(rs[0])))
 
-    # Linha de referência inferior do tronco: quadris se visíveis, senão a base
-    # da caixa (limita a região "acima do quadril").
-    hip_ys = [
-        float(keypoints[i][1])
-        for i in (KP_L_HIP, KP_R_HIP)
-        if _kp_ok(keypoints, i, conf_t)
-    ]
-    hip_y = float(np.mean(hip_ys)) if hip_ys else float(person_box[3])
-    torso_h = max(1.0, hip_y - shoulder_y)
-
-    # -- (1)+(2): melhor braço (mão erguida + cotovelo flexionado) ----------
+    # -- (1): melhor braço (mão à frente, baixa e com cotovelo flexionado) ---
     best_arm = 0.0
-    margin = 0.55 * shoulder_w  # tolerância lateral além dos ombros
+    margin = 0.45 * shoulder_w  # tolerância lateral além dos ombros
     for sh, el, wr in ARM_CHAINS:
         if not (_kp_ok(keypoints, wr, conf_t) and _kp_ok(keypoints, sh, conf_t)):
             continue
         wx, wy = float(keypoints[wr][0]), float(keypoints[wr][1])
 
-        # Altura da mão: 0 na linha do quadril, 1 na linha dos ombros (e além).
-        raised = (hip_y - wy) / torso_h
-        raised_score = float(np.clip(raised / 1.0, 0.0, 1.0))
-
         # Centralização: mão trazida à frente do corpo (entre os ombros ± margem).
         centered = 1.0 if (sx_min - margin) <= wx <= (sx_max + margin) else 0.0
 
-        # Cotovelo flexionado (precisa do cotovelo para medir o ângulo).
+        # Profundidade: quanto o pulso desce abaixo da linha dos ombros, em
+        # frações da largura dos ombros. ~0.15 (na linha) -> 0 ; ~1.0 (um ombro
+        # abaixo, mão no colo) -> 1. Distingue "mão baixa segurando celular" de
+        # "mão na altura da mesa digitando".
+        depth = float(np.clip(((wy - shoulder_y) / shoulder_w - 0.15) / 0.85, 0.0, 1.0))
+
+        # Cotovelo flexionado (precisa do cotovelo para medir o ângulo). Funciona
+        # como porta: braço esticado (mão largada ao lado) zera o braço.
         bend_score = 0.0
         if _kp_ok(keypoints, el, conf_t):
             ang = _interior_angle(
@@ -385,11 +415,23 @@ def phone_use_posture(
             # 160°+ (braço esticado) -> 0 ; 70° ou menos (bem dobrado) -> 1.
             bend_score = float(np.clip((160.0 - ang) / 90.0, 0.0, 1.0))
 
-        arm = centered * (0.6 * raised_score + 0.4 * bend_score)
+        arm = centered * bend_score * (0.45 + 0.55 * depth)
         best_arm = max(best_arm, arm)
 
+    # -- (2): mãos convergindo (segurando um único objeto) ------------------
+    conv_score = 0.0
+    if _kp_ok(keypoints, KP_L_WRIST, conf_t) and _kp_ok(keypoints, KP_R_WRIST, conf_t):
+        wrist_dist = float(
+            np.hypot(
+                keypoints[KP_L_WRIST][0] - keypoints[KP_R_WRIST][0],
+                keypoints[KP_L_WRIST][1] - keypoints[KP_R_WRIST][1],
+            )
+        )
+        # < ~0.4 largura de ombros (mãos juntas) -> 1 ; > ~1.1 (afastadas) -> 0.
+        conv_score = float(np.clip((1.1 - wrist_dist / shoulder_w) / 0.7, 0.0, 1.0))
+
     # -- (3): cabeça inclinada para baixo -----------------------------------
-    head_score = None
+    head_score = 0.0
     if _kp_ok(keypoints, KP_NOSE, conf_t) and (
         _kp_ok(keypoints, KP_L_EYE, conf_t) or _kp_ok(keypoints, KP_R_EYE, conf_t)
     ):
@@ -399,17 +441,15 @@ def phone_use_posture(
             if _kp_ok(keypoints, i, conf_t)
         ]
         eye_y = float(np.mean(eye_ys))
-        # Quanto o nariz está abaixo dos olhos, normalizado pela escala da face
-        # (aprox. fração da largura dos ombros). Ereto ~0.05–0.12; olhando para
-        # baixo o nariz desce bem mais. Mapeia 0.12→0 .. 0.32→1.
+        # Quanto o nariz está abaixo dos olhos, normalizado pela escala da face.
+        # Ereto ~0.05–0.12; olhando para baixo o nariz desce mais. 0.12→0 .. 0.32→1.
         drop = (float(keypoints[KP_NOSE][1]) - eye_y) / shoulder_w
         head_score = float(np.clip((drop - 0.12) / 0.20, 0.0, 1.0))
 
-    # -- combinação ---------------------------------------------------------
-    if head_score is None:
-        return float(np.clip(best_arm, 0.0, 1.0))
-    # Braço pesa mais (sinal mais discriminante); cabeça reforça.
-    return float(np.clip(0.7 * best_arm + 0.3 * head_score, 0.0, 1.0))
+    # -- combinação: o braço domina; mãos juntas e cabeça baixa reforçam -----
+    return float(
+        np.clip(0.62 * best_arm + 0.22 * conv_score + 0.16 * head_score, 0.0, 1.0)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +572,11 @@ class Detector:
 
             for i in range(len(xyxy)):
                 class_id = int(cls[i])
-                if class_id not in (cfg.person_class_id, cfg.phone_class_id):
+                if class_id not in (
+                    cfg.person_class_id,
+                    cfg.phone_class_id,
+                    cfg.laptop_class_id,
+                ):
                     continue
                 x1, y1, x2, y2 = (float(v) for v in xyxy[i][:4])
                 detections.append(
@@ -614,6 +658,40 @@ class Detector:
             if d.class_id == cfg.phone_class_id
         ]
 
+    def detect_objects(
+        self, frame: np.ndarray
+    ) -> tuple[list[Detection], list[Detection]]:
+        """Detecta CELULARES e NOTEBOOKS em UMA inferência (mesmo modelo).
+
+        Roda no limiar mais baixo (do celular) e filtra cada classe pelo seu
+        próprio limiar. Devolve ``(phones, laptops)``. Evita um segundo predict
+        só para o notebook — mantém o custo de tempo real próximo do anterior.
+        Se a supressão por notebook estiver desligada, não pede a classe dele.
+        """
+        self._validate_frame(frame)
+        cfg = self.config
+        classes = [cfg.phone_class_id]
+        if cfg.laptop_suppression_enabled:
+            classes.append(cfg.laptop_class_id)
+        results = self.model.predict(
+            frame,
+            conf=cfg.phone_confidence_threshold,
+            iou=cfg.nms_iou_threshold,
+            classes=classes,
+            imgsz=cfg.imgsz,
+            device=self._device,
+            verbose=False,
+        )
+        dets = self._parse_results(results, cfg)
+        phones = [d for d in dets if d.class_id == cfg.phone_class_id]
+        laptops = [
+            d
+            for d in dets
+            if d.class_id == cfg.laptop_class_id
+            and d.confidence >= cfg.laptop_confidence_threshold
+        ]
+        return phones, laptops
+
     def detect_people(self, frame: np.ndarray) -> list[PersonDetection]:
         """Detecta as pessoas + seus keypoints (modelo de pose)."""
         self._validate_frame(frame)
@@ -658,6 +736,7 @@ class Detector:
         self,
         people: list[PersonDetection],
         phones: list[Detection],
+        laptops: list[Detection] | None = None,
     ) -> list[PersonDetection]:
         """Decide quais pessoas estão SEGURANDO/USANDO um celular.
 
@@ -673,17 +752,28 @@ class Detector:
              pulso longe do celular significa "não está segurando" (precisão).
           3. (Sinal de POSTURA autônomo) Mesmo sem caixa de celular, marca uso
              quando a postura é fortemente típica (``posture_standalone_threshold``)
-             — generaliza além do que o detector COCO consegue ver.
+             — generaliza além do que o detector COCO consegue ver. SUPRIMIDO
+             para quem está com a mão sobre um NOTEBOOK (``laptops``): digitar
+             tem a mesma postura, então o contexto do objeto desempata.
         """
         cfg = self.config
+        laptop_boxes = [d.box for d in (laptops or [])]
 
         # Postura calculada UMA vez por pessoa (independe do celular). Vira
         # tanto reforço do raio (passo 1) quanto sinal autônomo (passo 3).
+        # ``on_laptop`` marca quem está com a mão no teclado (não é celular).
         for person in people:
             person.posture_score = (
                 phone_use_posture(person.keypoints, person.box, cfg)
                 if cfg.posture_enabled
                 else 0.0
+            )
+            person.on_laptop = wrist_over_any_box(
+                person.keypoints,
+                laptop_boxes,
+                person.box,
+                cfg,
+                cfg.laptop_wrist_radius_factor,
             )
 
         for phone in phones:
@@ -692,9 +782,13 @@ class Detector:
             best_wrist: tuple[float, float] | None = None
             best_score = float("inf")
             for person in people:
-                # Postura forte amplia o raio de tolerância pulso↔celular.
+                # Postura forte amplia o raio de tolerância pulso↔celular
+                # (exceto para quem está digitando no notebook).
                 scale = 1.0
-                if person.posture_score >= cfg.posture_assist_threshold:
+                if (
+                    person.posture_score >= cfg.posture_assist_threshold
+                    and not person.on_laptop
+                ):
                     scale = 1.0 + cfg.posture_radius_bonus * person.posture_score
                 holding, wrist, score = wrist_phone_proximity(
                     person.keypoints, phone.box, person.box, cfg, radius_scale=scale
@@ -743,8 +837,10 @@ class Detector:
         # contêm falsos positivos.
         if cfg.posture_enabled:
             for person in people:
-                if not person.using_phone and (
-                    person.posture_score >= cfg.posture_standalone_threshold
+                if (
+                    not person.using_phone
+                    and not person.on_laptop
+                    and person.posture_score >= cfg.posture_standalone_threshold
                 ):
                     person.using_phone = True
                     person.by_posture = True
@@ -769,7 +865,11 @@ class Detector:
                 frame,
                 conf=cfg.phone_confidence_threshold,
                 iou=cfg.nms_iou_threshold,
-                classes=[cfg.person_class_id, cfg.phone_class_id],
+                classes=[
+                    cfg.person_class_id,
+                    cfg.phone_class_id,
+                    cfg.laptop_class_id,
+                ],
                 imgsz=cfg.imgsz,
                 device=self._device,
                 verbose=False,
@@ -784,11 +884,14 @@ class Detector:
             phones = [
                 d for d in detections if d.class_id == cfg.phone_class_id
             ]
-            return self.associate(people, phones)
+            laptops = [
+                d for d in detections if d.class_id == cfg.laptop_class_id
+            ]
+            return self.associate(people, phones, laptops)
 
         people = self.detect_people(frame)
-        phones = self.detect_phones(frame)
-        return self.associate(people, phones)
+        phones, laptops = self.detect_objects(frame)
+        return self.associate(people, phones, laptops)
 
     def process_frame_tracked(self, frame: np.ndarray) -> list[PersonDetection]:
         """Igual a ``process_frame`` (caminho com pose), mas com rastreamento.
@@ -799,8 +902,8 @@ class Detector:
         """
         self._validate_frame(frame)
         people = self.detect_people_tracked(frame)
-        phones = self.detect_phones(frame)
-        return self.associate(people, phones)
+        phones, laptops = self.detect_objects(frame)
+        return self.associate(people, phones, laptops)
 
 
 # ---------------------------------------------------------------------------
