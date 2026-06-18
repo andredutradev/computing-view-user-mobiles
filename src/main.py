@@ -189,6 +189,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Desliga a suavização temporal/histerese (volta a piscar).",
     )
     parser.add_argument(
+        "--laptop",
+        action="store_true",
+        help="Liga o reconhecimento de NOTEBOOK (classe COCO 63) para não marcar "
+        "quem digita como 'usando celular'. Padrão: desligado (só celular, mais leve).",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda", "mps"],
         help="Dispositivo de inferência (padrão: auto -> cuda/mps/cpu).",
@@ -275,6 +281,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         overrides["tracker_config"] = f"{args.tracker}.yaml"
     if args.no_smooth:
         overrides["smoothing_enabled"] = False
+    if args.laptop:
+        overrides["laptop_suppression_enabled"] = True
     if args.device:
         overrides["device"] = args.device
     if args.imgsz is not None:

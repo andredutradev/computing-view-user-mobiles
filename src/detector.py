@@ -72,6 +72,8 @@ from src.config import Config, settings
 KP_NOSE = 0
 KP_L_EYE = 1
 KP_R_EYE = 2
+KP_L_EAR = 3
+KP_R_EAR = 4
 KP_L_SHOULDER = 5
 KP_R_SHOULDER = 6
 KP_L_ELBOW = 7
@@ -145,6 +147,10 @@ class PersonDetection(Detection):
     # (está digitando). Suprime o sinal de postura para não confundir com
     # celular. Não impede um celular REAL detectado na mão.
     on_laptop: bool = False
+    # Score [0..1] de ALINHAMENTO ROSTO→MÃOS: 1.0 = o rosto está virado/baixo
+    # para a direção das mãos (olhando a tela). Gate de precisão do sinal de
+    # postura autônomo (sem caixa de celular). 0.0 sem rosto/mãos visíveis.
+    face_to_hands: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +353,296 @@ def _interior_angle(a, b, c) -> float:
     return float(np.degrees(np.arccos(cosang)))
 
 
+def _head_drop_ears(keypoints: np.ndarray, shoulder_w: float, conf_t: float) -> float | None:
+    """Inclinação do rosto = (nariz − linha das orelhas) / largura dos ombros.
+
+    Olhando para frente o nariz fica ~na linha das orelhas (valor ~0); olhando
+    para baixo o nariz desce abaixo delas (positivo); cabeça erguida dá negativo.
+    Mais robusto que nariz×olhos. Retorna ``None`` se faltam nariz/orelhas.
+    """
+    if not _kp_ok(keypoints, KP_NOSE, conf_t):
+        return None
+    ear_ys = [
+        float(keypoints[i][1])
+        for i in (KP_L_EAR, KP_R_EAR)
+        if _kp_ok(keypoints, i, conf_t)
+    ]
+    if not ear_ys:
+        return None
+    return (float(keypoints[KP_NOSE][1]) - float(np.mean(ear_ys))) / shoulder_w
+
+
+def _wrist_convergence(keypoints: np.ndarray, shoulder_w: float, conf_t: float) -> float | None:
+    """Convergência das mãos [0..1]: 1 = pulsos juntos (segurando um objeto),
+    0 = afastados (largura de teclado / mãos livres). ``None`` se um pulso falta.
+    """
+    if not (_kp_ok(keypoints, KP_L_WRIST, conf_t) and _kp_ok(keypoints, KP_R_WRIST, conf_t)):
+        return None
+    wrist_dist = float(
+        np.hypot(
+            keypoints[KP_L_WRIST][0] - keypoints[KP_R_WRIST][0],
+            keypoints[KP_L_WRIST][1] - keypoints[KP_R_WRIST][1],
+        )
+    ) / shoulder_w
+    return float(np.clip((1.1 - wrist_dist) / 0.7, 0.0, 1.0))
+
+
+def _hidden_hands_posture(
+    keypoints: np.ndarray,
+    shoulder_y: float,
+    shoulder_w: float,
+    sx_min: float,
+    sx_max: float,
+    conf_t: float,
+    cfg: Config,
+) -> float:
+    """Score [0..1] do sinal "braços projetados + cabeça baixa + mãos ocupadas".
+
+    Decisão em PORTAS (todas precisam passar; senão 0 — cai na via antiga de
+    detectar o objeto na mão), nesta ordem:
+
+      1. CABEÇA BAIXA (pré-requisito): o rosto precisa estar inclinado p/ baixo
+         (nariz abaixo da linha das orelhas). Rosto erguido => não é uso.
+      2. MÃOS À MOSTRA: os dois pulsos precisam ser visíveis (confiáveis) para
+         avaliar se as mãos estão juntas ou separadas. Sem isso, não validamos
+         por postura (deixa a detecção do objeto decidir).
+      3. MÃOS JUNTAS (ocupadas): pulsos próximos = segurando algo. Mãos à mostra
+         SEPARADAS, sem objeto e olhando p/ baixo NÃO é uso de celular.
+      4. BRAÇOS projetados p/ frente/baixo + MÃOS fundas (``reach``) — a postura
+         em si; vira a magnitude do score depois que as portas passam.
+
+    A SENSIBILIDADE (``posture_hidden_sensitivity`` 0..1) afrouxa as portas de
+    cabeça baixa e de convergência: maior = pega mais (recall), menor = exige
+    mais (precisão).
+    """
+    sens = float(np.clip(cfg.posture_hidden_sensitivity, 0.0, 1.0))
+
+    # (1) PORTA: cabeça baixa. Exigência cai com a sensibilidade.
+    head_drop = _head_drop_ears(keypoints, shoulder_w, conf_t)
+    head_min = 0.16 - 0.14 * sens  # sens 0 -> 0.16 (bem baixo) ; 1 -> 0.02 (leve)
+    if head_drop is None or head_drop < head_min:
+        return 0.0
+
+    # (2) PORTA: mãos à mostra (os dois pulsos visíveis) + (3) mãos juntas.
+    conv = _wrist_convergence(keypoints, shoulder_w, conf_t)
+    conv_min = 0.45 - 0.25 * sens  # sens 0 -> 0.45 (bem juntas) ; 1 -> 0.20
+    if conv is None or conv < conv_min:
+        return 0.0
+
+    # (4) BRAÇOS projetados p/ frente/baixo + mãos fundas.
+    margin = 0.5 * shoulder_w
+    best_reach = 0.0
+    for sh, el, wr in ARM_CHAINS:
+        if not (
+            _kp_ok(keypoints, wr, conf_t)
+            and _kp_ok(keypoints, el, conf_t)
+            and _kp_ok(keypoints, sh, conf_t)
+        ):
+            continue
+        wx, wy = float(keypoints[wr][0]), float(keypoints[wr][1])
+        el_y = float(keypoints[el][1])
+
+        centered = 1.0 if (sx_min - margin) <= wx <= (sx_max + margin) else 0.0
+        # Mãos bem abaixo dos ombros (altura do colo/abaixo da banca).
+        deep = float(np.clip(((wy - shoulder_y) / shoulder_w - 0.6) / 0.7, 0.0, 1.0))
+        # Antebraço apontando para baixo (pulso abaixo do cotovelo).
+        reach_down = float(np.clip((wy - el_y) / (0.35 * shoulder_w), 0.0, 1.0))
+        # Cotovelo abaixo dos ombros (braço projetado para frente/baixo).
+        elbow_fwd = float(
+            np.clip(((el_y - shoulder_y) / shoulder_w - 0.2) / 0.6, 0.0, 1.0)
+        )
+        reach = centered * deep * (0.4 + 0.3 * reach_down + 0.3 * elbow_fwd)
+        best_reach = max(best_reach, reach)
+
+    if best_reach <= 0.0:
+        return 0.0
+
+    # Portas passaram: a magnitude vem do reach, levemente reforçada pelas mãos juntas.
+    return float(np.clip(best_reach * (0.85 + 0.15 * conv), 0.0, 1.0))
+
+
+def _head_pose(
+    keypoints: np.ndarray, conf_t: float
+) -> tuple[tuple[float, float], tuple[float, float], float] | None:
+    """Pose 2D aproximada da cabeça a partir dos keypoints faciais.
+
+    Retorna ``(nose, ref, face_scale)`` onde:
+      - ``nose`` = (x, y) do nariz (obrigatório; ``None`` se ausente);
+      - ``ref``  = (x, y) da BASE do rosto — média das ORELHAS confiáveis
+        (preferido) ou, na falta, dos OLHOS. A direção nariz→ref dá o YAW
+        (horizontal) e o PITCH (vertical) do rosto;
+      - ``face_scale`` = tamanho do rosto em pixels (distância nariz↔base),
+        usado para normalizar e ficar invariante à distância da câmera.
+
+    De PERFIL só uma orelha aparece e o nariz se afasta dela horizontalmente:
+    o sinal de ``nose_x − ref_x`` indica para que lado o rosto aponta. De FRENTE
+    o nariz fica ~entre as orelhas (yaw ~0) e o sinal forte vem do PITCH (nariz
+    abaixo da linha das orelhas/olhos = olhando para baixo).
+    """
+    if not _kp_ok(keypoints, KP_NOSE, conf_t):
+        return None
+    nose = (float(keypoints[KP_NOSE][0]), float(keypoints[KP_NOSE][1]))
+
+    ears = [
+        (float(keypoints[i][0]), float(keypoints[i][1]))
+        for i in (KP_L_EAR, KP_R_EAR)
+        if _kp_ok(keypoints, i, conf_t)
+    ]
+    if ears:
+        rx = float(np.mean([e[0] for e in ears]))
+        ry = float(np.mean([e[1] for e in ears]))
+        scale = float(np.mean([np.hypot(nose[0] - e[0], nose[1] - e[1]) for e in ears]))
+        return nose, (rx, ry), max(scale, 1.0)
+
+    eyes = [
+        (float(keypoints[i][0]), float(keypoints[i][1]))
+        for i in (KP_L_EYE, KP_R_EYE)
+        if _kp_ok(keypoints, i, conf_t)
+    ]
+    if eyes:
+        rx = float(np.mean([e[0] for e in eyes]))
+        ry = float(np.mean([e[1] for e in eyes]))
+        span = (
+            float(np.hypot(eyes[0][0] - eyes[1][0], eyes[0][1] - eyes[1][1]))
+            if len(eyes) == 2
+            else 0.0
+        )
+        scale = max(span, float(np.hypot(nose[0] - rx, nose[1] - ry)))
+        return nose, (rx, ry), max(scale, 1.0)
+
+    return None
+
+
+def _hands_centroid(
+    keypoints: np.ndarray, conf_t: float
+) -> tuple[float, float, int] | None:
+    """Centroide (x, y) dos PULSOS confiáveis + a contagem. ``None`` se nenhum."""
+    xs, ys = [], []
+    for idx in (KP_L_WRIST, KP_R_WRIST):
+        if _kp_ok(keypoints, idx, conf_t):
+            xs.append(float(keypoints[idx][0]))
+            ys.append(float(keypoints[idx][1]))
+    if not xs:
+        return None
+    return float(np.mean(xs)), float(np.mean(ys)), len(xs)
+
+
+def face_toward_hands(
+    keypoints: np.ndarray | None,
+    cfg: Config,
+) -> float:
+    """Score [0..1]: o ROSTO está virado/baixo para a DIREÇÃO das mãos?
+
+    É o gate de precisão pedido: para marcar uso de celular SEM ver o aparelho,
+    o aluno precisa estar OLHANDO para as próprias mãos (a tela). Combina:
+
+      - **Horizontal (yaw)**: se as mãos estão ~sob o rosto (``|dx|`` pequeno),
+        olhar para baixo já basta; se as mãos estão para um LADO (perfil/braço
+        esticado), o rosto precisa apontar para esse lado — o nariz se desloca
+        para o mesmo lado das mãos em relação à orelha/olho. Mãos de um lado e
+        rosto para o outro ⇒ 0 (não está olhando para elas).
+      - **Vertical (pitch)**: o nariz precisa cair abaixo da linha das orelhas/
+        olhos (cabeça baixa, olhando a tela). Cabeça erguida ⇒ ~0.
+      - **Mãos abaixo do rosto**: reforço — quem mexe no celular o segura abaixo
+        do rosto (colo/à frente), então as mãos ficam mais baixas que a cabeça.
+
+    Retorna 0.0 quando faltam nariz, base do rosto (orelha/olho) ou pulsos —
+    nesse caso NÃO dá para confirmar o olhar e o sinal autônomo não deve marcar.
+    """
+    if keypoints is None:
+        return 0.0
+    hp = _head_pose(keypoints, cfg.wrist_conf_threshold)
+    hc = _hands_centroid(keypoints, cfg.wrist_conf_threshold)
+    if hp is None or hc is None:
+        return 0.0
+    (nx, ny), (rx, ry), fscale = hp
+    hcx, hcy, _ = hc
+
+    dx = hcx - nx  # mãos à direita (+) / esquerda (−) do nariz
+    dy = hcy - ny  # mãos abaixo (+) / acima (−) do nariz
+    yaw = nx - rx  # nariz à direita (+) / esquerda (−) da base do rosto
+    pitch = ny - ry  # nariz abaixo (+) da base = olhando para baixo
+
+    # -- horizontal: rosto apontando para o lado das mãos ------------------
+    band = 0.45 * fscale  # mãos ~sob o rosto: olhar p/ baixo já resolve o lado
+    if abs(dx) <= band:
+        horiz = 0.75
+    elif (yaw > 0.0) == (dx > 0.0) and abs(yaw) >= 0.20 * fscale:
+        horiz = float(np.clip((abs(yaw) / fscale) / 0.70, 0.0, 1.0))
+    else:
+        horiz = 0.0  # mãos de um lado, rosto para o outro → não está olhando
+
+    # -- vertical: cabeça baixa (olhando para a tela) ----------------------
+    pitch_score = float(np.clip((pitch / fscale - 0.10) / 0.35, 0.0, 1.0))
+
+    # -- reforço: mãos abaixo do rosto (segurando à frente/no colo) --------
+    below = float(np.clip(dy / (2.0 * fscale), 0.0, 1.0))
+
+    return float(np.clip(horiz * pitch_score * (0.5 + 0.5 * below), 0.0, 1.0))
+
+
+def _is_profile_view(
+    keypoints: np.ndarray,
+    person_box: tuple[float, float, float, float],
+    conf_t: float,
+    cfg: Config,
+) -> bool:
+    """True se a pessoa está de PERFIL (de lado) para a câmera.
+
+    De lado, os dois ombros se projetam quase no mesmo x (largura entre ombros
+    ≈ 0), então a razão ``largura_ombros / largura_da_caixa`` despenca. Quando
+    só um ombro é confiável, também tratamos como perfil.
+    """
+    ls_ok = _kp_ok(keypoints, KP_L_SHOULDER, conf_t)
+    rs_ok = _kp_ok(keypoints, KP_R_SHOULDER, conf_t)
+    if ls_ok and rs_ok:
+        sw = float(
+            np.hypot(
+                keypoints[KP_L_SHOULDER][0] - keypoints[KP_R_SHOULDER][0],
+                keypoints[KP_L_SHOULDER][1] - keypoints[KP_R_SHOULDER][1],
+            )
+        )
+        box_w = max(1.0, person_box[2] - person_box[0])
+        return (sw / box_w) < cfg.posture_profile_sw_ratio
+    # Sem os dois ombros não há como rodar a via frontal — trata como perfil.
+    return True
+
+
+def _profile_phone_posture(
+    keypoints: np.ndarray,
+    cfg: Config,
+) -> float:
+    """Score [0..1] de uso de celular para pessoa de PERFIL (de lado).
+
+    De lado a regra frontal (mãos entre os ombros + convergência) não vale: os
+    ombros colapsam e as mãos ficam à frente do corpo, não "centradas". O sinal
+    robusto aqui é o ROSTO virado/baixo para as mãos (``face_toward_hands``),
+    que já exige olhar para a direção das mãos abaixo/à frente — exatamente o
+    discriminador entre "usando de lado" e "só sentado de lado". O ângulo do
+    cotovelo (antebraço dobrado segurando o aparelho) dá um reforço quando
+    visível.
+    """
+    conf_t = cfg.wrist_conf_threshold
+    ft = face_toward_hands(keypoints, cfg)
+    if ft <= 0.0:
+        return 0.0
+
+    # Reforço por cotovelo flexionado (antebraço dobrado). Sem cotovelo visível,
+    # mantém-se neutro (0.5) — não penaliza o perfil, em que ele some com frequência.
+    best_bend = 0.0
+    have_elbow = False
+    for sh, el, wr in ARM_CHAINS:
+        if not (_kp_ok(keypoints, wr, conf_t) and _kp_ok(keypoints, el, conf_t)
+                and _kp_ok(keypoints, sh, conf_t)):
+            continue
+        have_elbow = True
+        ang = _interior_angle(keypoints[sh][:2], keypoints[el][:2], keypoints[wr][:2])
+        best_bend = max(best_bend, float(np.clip((160.0 - ang) / 90.0, 0.0, 1.0)))
+    bend = best_bend if have_elbow else 0.5
+
+    return float(np.clip(ft * (0.7 + 0.3 * bend), 0.0, 1.0))
+
+
 def phone_use_posture(
     keypoints: np.ndarray | None,
     person_box: tuple[float, float, float, float],
@@ -374,8 +670,21 @@ def phone_use_posture(
     Retorna 0.0 sem pose/ombros confiáveis. OBS.: a postura de quem usa NOTEBOOK
     é parecida; a separação fina é feita por contexto (supressão por notebook em
     ``Detector.associate``), não aqui.
+
+    De PERFIL (pessoa de lado) a heurística frontal não vale — os ombros se
+    sobrepõem e as mãos ficam à frente, não centradas. Aí desviamos para
+    ``_profile_phone_posture`` (rosto virado/baixo para a direção das mãos).
     """
     conf_t = cfg.wrist_conf_threshold
+    if keypoints is None:
+        return 0.0
+
+    # Perfil (de lado): via dedicada baseada no rosto → mãos.
+    if cfg.posture_profile_enabled and _is_profile_view(
+        keypoints, person_box, conf_t, cfg
+    ):
+        return _profile_phone_posture(keypoints, cfg)
+
     if not (
         _kp_ok(keypoints, KP_L_SHOULDER, conf_t)
         and _kp_ok(keypoints, KP_R_SHOULDER, conf_t)
@@ -447,9 +756,18 @@ def phone_use_posture(
         head_score = float(np.clip((drop - 0.12) / 0.20, 0.0, 1.0))
 
     # -- combinação: o braço domina; mãos juntas e cabeça baixa reforçam -----
-    return float(
-        np.clip(0.62 * best_arm + 0.22 * conv_score + 0.16 * head_score, 0.0, 1.0)
-    )
+    held_score = 0.62 * best_arm + 0.22 * conv_score + 0.16 * head_score
+
+    # -- sinal complementar: MÃOS ESCONDIDAS (braços projetados + rosto baixo) --
+    # Pega o celular fora de vista (colo/atrás da cadeira), quando o cotovelo
+    # abre e a heurística de "segurar no peito" perde o sinal.
+    hidden_score = 0.0
+    if cfg.posture_hidden_enabled:
+        hidden_score = _hidden_hands_posture(
+            keypoints, shoulder_y, shoulder_w, sx_min, sx_max, conf_t, cfg
+        )
+
+    return float(np.clip(max(held_score, hidden_score), 0.0, 1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -684,12 +1002,16 @@ class Detector:
         )
         dets = self._parse_results(results, cfg)
         phones = [d for d in dets if d.class_id == cfg.phone_class_id]
-        laptops = [
-            d
-            for d in dets
-            if d.class_id == cfg.laptop_class_id
-            and d.confidence >= cfg.laptop_confidence_threshold
-        ]
+        laptops = (
+            [
+                d
+                for d in dets
+                if d.class_id == cfg.laptop_class_id
+                and d.confidence >= cfg.laptop_confidence_threshold
+            ]
+            if cfg.laptop_suppression_enabled
+            else []
+        )
         return phones, laptops
 
     def detect_people(self, frame: np.ndarray) -> list[PersonDetection]:
@@ -768,6 +1090,12 @@ class Detector:
                 if cfg.posture_enabled
                 else 0.0
             )
+            # Alinhamento rosto→mãos (gate do sinal autônomo de postura).
+            person.face_to_hands = (
+                face_toward_hands(person.keypoints, cfg)
+                if cfg.posture_enabled
+                else 0.0
+            )
             person.on_laptop = wrist_over_any_box(
                 person.keypoints,
                 laptop_boxes,
@@ -834,13 +1162,20 @@ class Detector:
         # -- Passo 3: postura autônoma (sem caixa de celular) ---------------
         # Para quem ainda não foi marcado por um celular detectado, a postura
         # muito típica de uso já basta. Limiar alto + suavização temporal
-        # contêm falsos positivos.
+        # contêm falsos positivos. GATE de precisão (pedido do usuário): sem ver
+        # o aparelho, só marca se o ROSTO estiver virado/baixo para as MÃOS —
+        # braços no ângulo mas olhando para frente/longe das mãos = só sentado.
         if cfg.posture_enabled:
             for person in people:
+                face_ok = (
+                    not cfg.posture_face_gate_enabled
+                    or person.face_to_hands >= cfg.face_hands_min_score
+                )
                 if (
                     not person.using_phone
                     and not person.on_laptop
                     and person.posture_score >= cfg.posture_standalone_threshold
+                    and face_ok
                 ):
                     person.using_phone = True
                     person.by_posture = True

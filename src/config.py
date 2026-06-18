@@ -191,6 +191,45 @@ class Config:
     posture_radius_bonus: float = _env_float("CVUM_POSTURE_RADIUS_BONUS", 0.6)
 
     # ------------------------------------------------------------------
+    # Postura de MÃOS ESCONDIDAS (celular fora de vista, no colo/atrás da cadeira)
+    # ------------------------------------------------------------------
+    # Quando a pessoa estica os braços à frente/para baixo, abaixa o rosto e
+    # esconde as mãos (atrás da cadeira/abaixo da banca), o cotovelo ABRE e a
+    # heurística de "segurar no peito" não pega. Este sinal complementar combina
+    # BRAÇOS projetados para baixo + MÃOS fundas (bem abaixo dos ombros) + ROSTO
+    # baixo (nariz abaixo da linha das orelhas) — pega o celular escondido.
+    posture_hidden_enabled: bool = _env_bool("CVUM_POSTURE_HIDDEN", True)
+    # Escala de PRECISÃO/SENSIBILIDADE [0..1] deste sinal (análogo aos limiares
+    # de postura acima). 0 = mais preciso/exigente (requer rosto bem baixo, gera
+    # menos detecções); 1 = mais sensível (aceita rosto pouco inclinado, pega
+    # mais casos — porém com mais risco de falso-positivo, ex.: mãos no colo).
+    posture_hidden_sensitivity: float = _env_float("CVUM_POSTURE_HIDDEN_SENS", 0.6)
+
+    # ------------------------------------------------------------------
+    # ROSTO → MÃOS (gate anti-falso-positivo) e POSTURA DE PERFIL (lado)
+    # ------------------------------------------------------------------
+    # Requisito de precisão do usuário: para marcar uso de celular SEM ver o
+    # aparelho (só por postura), o ROSTO precisa estar virado para a DIREÇÃO das
+    # mãos (olhando para a tela). Braços no ângulo "de celular" mas com o rosto
+    # para frente/longe das mãos = aluno só sentado, NÃO é uso. Com um celular
+    # REALMENTE detectado na mão, este gate não se aplica (ver o aparelho basta).
+    posture_face_gate_enabled: bool = _env_bool("CVUM_FACE_GATE", True)
+    # Score [0..1] mínimo do alinhamento rosto→mãos para liberar o sinal de
+    # postura autônomo. Maior = mais exigente (rosto bem virado/baixo p/ as mãos).
+    face_hands_min_score: float = _env_float("CVUM_FACE_HANDS_MIN", 0.30)
+
+    # Postura de PERFIL (pessoa de lado para a câmera). De lado os ombros se
+    # sobrepõem (largura ~0) e a heurística frontal de "mãos centradas entre os
+    # ombros" não funciona; usamos o rosto (nariz×orelha visível) para achar a
+    # direção do olhar e exigir que ele aponte para as mãos, abaixo e à frente.
+    posture_profile_enabled: bool = _env_bool("CVUM_POSTURE_PROFILE", True)
+    # Abaixo desta razão (largura entre ombros / largura da caixa) tratamos a
+    # pose como PERFIL. Medido em vídeo: perfil de lado ~0.01-0.22; sala
+    # angulada (semi-frontal) ~0.28-0.51; frontal sintético ~0.57+. 0.25 mantém
+    # a sala no caminho frontal validado e o perfil real na via dedicada.
+    posture_profile_sw_ratio: float = _env_float("CVUM_PROFILE_SW_RATIO", 0.25)
+
+    # ------------------------------------------------------------------
     # Supressão por NOTEBOOK (contexto de objeto) — evita falso-positivo
     # ------------------------------------------------------------------
     # Quem usa notebook tem a MESMA postura do celular (cabeça baixa + mãos à
@@ -199,8 +238,11 @@ class Config:
     # (classe COCO 63, que sai com alta confiança), ela está digitando — não
     # marcamos uso de celular por postura nela. O celular REAL detectado na mão
     # ainda conta (o usuário de notebook não tem caixa de celular no pulso).
+    # Padrão DESLIGADO (mais leve: o detector pede só a classe celular). Ligue
+    # com a flag --laptop (ou CVUM_LAPTOP_SUPPRESS=1) quando houver notebooks na
+    # cena e você quiser evitar marcá-los como celular por postura.
     laptop_class_id: int = 63
-    laptop_suppression_enabled: bool = _env_bool("CVUM_LAPTOP_SUPPRESS", True)
+    laptop_suppression_enabled: bool = _env_bool("CVUM_LAPTOP_SUPPRESS", False)
     # Confiança mínima para aceitar um notebook como contexto de supressão.
     laptop_confidence_threshold: float = _env_float("CVUM_LAPTOP_CONF", 0.40)
     # Raio (× escala da pessoa) para considerar o pulso "sobre" o notebook.

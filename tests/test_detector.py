@@ -207,6 +207,48 @@ def test_detect_phones_parses_only_phones(frame):
     assert all(isinstance(p, Detection) for p in phones)
 
 
+class _RecordingYOLO:
+    """Modelo fake que registra o kwarg ``classes`` de cada predict."""
+
+    def __init__(self, boxes: _FakeBoxes):
+        self._boxes = boxes
+        self.last_classes = None
+
+    def predict(self, frame, **kwargs):
+        self.last_classes = kwargs.get("classes")
+        return [_FakeResult(self._boxes)]
+
+
+def test_detect_objects_splits_phones_and_laptops(frame):
+    """Com supressão ligada: pede celular+notebook e separa por classe/limiar."""
+    boxes = _FakeBoxes(
+        xyxy=[[150, 150, 180, 200], [300, 100, 380, 140], [10, 10, 40, 40]],
+        cls=[67, 63, 63],
+        conf=[0.8, 0.85, 0.20],  # o notebook de conf 0.20 cai abaixo do limiar (0.40)
+    )
+    model = _RecordingYOLO(boxes)
+    detector = Detector(model=model, config=Config(laptop_suppression_enabled=True))
+    phones, laptops = detector.detect_objects(frame)
+    assert model.last_classes == [67, 63]  # pediu as duas classes
+    assert len(phones) == 1 and phones[0].class_id == 67
+    assert len(laptops) == 1 and laptops[0].class_id == 63  # só o de conf alta
+
+
+def test_detect_objects_phone_only_when_laptop_disabled(frame):
+    """Com --no-laptop: NÃO pede a classe do notebook (mais leve) e não retorna laptops."""
+    boxes = _FakeBoxes(
+        xyxy=[[150, 150, 180, 200], [300, 100, 380, 140]],
+        cls=[67, 63],
+        conf=[0.8, 0.85],
+    )
+    model = _RecordingYOLO(boxes)
+    detector = Detector(model=model, config=Config(laptop_suppression_enabled=False))
+    phones, laptops = detector.detect_objects(frame)
+    assert model.last_classes == [67]  # só celular -> caminho leve
+    assert len(phones) == 1
+    assert laptops == []
+
+
 def test_detect_people_parses_boxes_and_keypoints(frame):
     boxes = _FakeBoxes(xyxy=[[100, 50, 200, 400]], cls=[0], conf=[0.9])
     kp_data = _person_kp((165, 175))[None, :, :]  # (1, 17, 3)

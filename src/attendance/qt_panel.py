@@ -151,6 +151,7 @@ class QtControlPanel:
         from PySide6.QtGui import QFont
         from PySide6.QtWidgets import (
             QApplication,
+            QCheckBox,
             QComboBox,
             QFileDialog,
             QFrame,
@@ -244,14 +245,36 @@ class QtControlPanel:
         )
         gr.addWidget(self.thresh_slider, 3, 0)
         gr.addWidget(self.thresh_label, 3, 1)
+
+        # Sinal de "mãos escondidas" (braços projetados + cabeça baixa + mãos
+        # ocupadas) — ativável e com sensibilidade própria, independente do resto.
+        self.hidden_check = QCheckBox(
+            "Detectar mãos escondidas (braços à frente + cabeça baixa)"
+        )
+        self.hidden_check.setChecked(self.config.posture_hidden_enabled)
+        gr.addWidget(self.hidden_check, 4, 0, 1, 2)
+        gr.addWidget(QLabel("Sensibilidade (mãos escondidas):"), 5, 0, 1, 2)
+        self.hidden_slider = QSlider(Qt.Horizontal)
+        self.hidden_slider.setRange(0, 100)
+        self.hidden_slider.setValue(int(self.config.posture_hidden_sensitivity * 100))
+        self.hidden_label = QLabel(f"{self.config.posture_hidden_sensitivity:.2f}")
+        self.hidden_slider.valueChanged.connect(
+            lambda v: self.hidden_label.setText(f"{v / 100:.2f}")
+        )
+        # Cinza/ativa o slider conforme o checkbox.
+        self.hidden_slider.setEnabled(self.config.posture_hidden_enabled)
+        self.hidden_check.toggled.connect(self.hidden_slider.setEnabled)
+        gr.addWidget(self.hidden_slider, 6, 0)
+        gr.addWidget(self.hidden_label, 6, 1)
+
         self.start_btn = QPushButton("▶  Iniciar")
         self.start_btn.setObjectName("accent")
         self.start_btn.clicked.connect(self._start)
-        gr.addWidget(self.start_btn, 4, 0)
+        gr.addWidget(self.start_btn, 7, 0)
         self.stop_btn = QPushButton("■  Parar")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop)
-        gr.addWidget(self.stop_btn, 4, 1)
+        gr.addWidget(self.stop_btn, 7, 1)
         right.addWidget(gb_run)
 
         # (3) Relatório
@@ -373,6 +396,8 @@ class QtControlPanel:
             face_match_threshold=self.thresh_slider.value() / 100.0,
             video_source_type="file" if self.source_combo.currentIndex() == 1 else "webcam",
             video_path=self.video_path_edit.text(),
+            posture_hidden_enabled=self.hidden_check.isChecked(),
+            posture_hidden_sensitivity=self.hidden_slider.value() / 100.0,
         )
 
     def _start(self) -> None:
