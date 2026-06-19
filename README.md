@@ -159,6 +159,48 @@ Na primeira execução os pesos do YOLO são baixados automaticamente:
 `yolo11m.pt` (detecção do celular) e `yolo11s-pose.pt` (pose — braços e mãos).
 Nenhuma dependência nova é necessária: a pose já vem no `ultralytics`.
 
+## Docker
+
+O projeto pode rodar com um único `Dockerfile`. Não há necessidade de
+`docker compose` para a execução padrão, porque a aplicação não depende de
+banco, fila, proxy ou outro serviço externo.
+
+```bash
+docker build -t computing-view-user-mobiles .
+```
+
+A imagem instala PyTorch em modo CPU por padrão. Se você precisar de uma base
+com GPU/CUDA, ajuste o `Dockerfile`/imagem base conforme o runtime NVIDIA do
+ambiente.
+
+Validação headless, sem câmera e sem YOLO:
+
+```bash
+docker run --rm computing-view-user-mobiles
+```
+
+Rodar com vídeo local e gravar saída anotada:
+
+```bash
+docker run --rm \
+  -v "$PWD/data:/app/data" \
+  computing-view-user-mobiles \
+  --source file --video data/sample_video.mp4 --no-display --save data/output.mp4
+```
+
+Para webcam no Linux, exponha o dispositivo:
+
+```bash
+docker run --rm --device /dev/video0:/dev/video0 \
+  -v "$PWD/data:/app/data" \
+  computing-view-user-mobiles --source webcam
+```
+
+Os pesos `.pt`, vídeos e dados em `data/` ficam fora do contexto de build por
+padrão via `.dockerignore`, evitando imagens grandes e inclusão acidental de
+dados biométricos. Monte `data/` como volume quando precisar persistir vídeos,
+galerias de alunos, relatórios ou modelos baixados em tempo de execução.
+
 ## Execução
 
 ```bash
